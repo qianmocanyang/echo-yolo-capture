@@ -43,6 +43,7 @@ from echo.region import (  # noqa: E402
     Region,
     apply_ratio_lock,
     center_region,
+    fit_region_to_source,
     parse_size,
     validate_size,
 )
@@ -106,6 +107,24 @@ class TestRegion(unittest.TestCase):
         self.assertEqual((region.width, region.height), (320, 320))
         self.assertEqual((region.x, region.y), (1600, 760))
         self.assertTrue(region.is_inside(1920, 1080))
+
+    def test_fit_keeps_inside_region(self):
+        """本就在源内的选区原样返回，不挪不改。"""
+        region = Region(800, 380, 320, 320)
+        fitted = fit_region_to_source(1920, 1080, region)
+        self.assertEqual(fitted, region)
+
+    def test_fit_shrinks_oversized_region(self):
+        """大窗口选区换到小屏幕：尺寸收缩并居中，validate_size 不再拦截。"""
+        fitted = fit_region_to_source(1366, 768, Region(0, 0, 1920, 1080))
+        self.assertTrue(fitted.is_inside(1366, 768))
+        self.assertTrue(validate_size(fitted.width, fitted.height, 1366, 768).ok)
+
+    def test_fit_smaller_than_min_source(self):
+        """源比 MIN_SIDE 还小（极端情况）也不能产出非法选区。"""
+        fitted = fit_region_to_source(8, 8, Region(0, 0, 320, 320))
+        self.assertEqual((fitted.width, fitted.height), (MIN_SIDE, MIN_SIDE))
+        self.assertEqual((fitted.x, fitted.y), (0, 0))
 
     def test_clamp_negative_origin(self):
         region = Region(-50, -80, 320, 320).clamp(1920, 1080)

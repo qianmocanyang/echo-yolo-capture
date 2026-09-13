@@ -60,7 +60,7 @@ from .capture.base import DEFAULT_DELIVERY_INTERVAL_MS
 from .config import AppConfig
 from .logging_setup import get_logger
 from .quality import BLANK_LUMA, QualityReport, find_similar, measure, quick_luma
-from .region import Region, center_region, validate_size
+from .region import Region, center_region, fit_region_to_source, validate_size
 from .storage import (
     Database,
     ImageRecord,
@@ -631,8 +631,13 @@ class CapturePipeline(QObject):
 
         ok, message = self._validate_region_for(source)
         if not ok:
-            return False, message
-
+            # 换源时选区可能比新源还大（比如从 1920×1080 的游戏窗口
+            # 换到一块更小的屏幕）。直接拒绝会让这个源永远选不上，
+            # 主按钮从此灰掉、界面上又看不出原因——这里自动收缩并居中，
+            # 手动输入越界仍然由 set_region 硬拦（方案 §3.3 的本意）。
+            self._region = fit_region_to_source(
+                source.source_width, source.source_height, self._region
+            )
         self._source = source
         self._backend_key = resolution.key
         self._waiting_reason = ""

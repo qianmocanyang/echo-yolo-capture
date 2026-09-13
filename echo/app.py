@@ -43,6 +43,7 @@ from .region import (
     RegionMode,
     apply_ratio_lock,
     center_region,
+    fit_region_to_source,
     parse_size,
     validate_size,
 )
@@ -207,6 +208,8 @@ class EchoApp(QObject):
         if warning:
             self.backend_notice.emit(warning)
         self._sync_backend_from_pipeline()
+        # 恢复的源可能比上次的小（换了显示器/改了分辨率），同样要收选区
+        self._fit_region_to_source(matches[0])
 
     # ==================================================================
     # 配置
@@ -287,14 +290,7 @@ class EchoApp(QObject):
         self.config.capture.source_identity = spec.identity
         self.config.capture.monitor_device = spec.monitor_device
         self._sync_backend_from_pipeline()
-        # 换源后把选区按新采集源重新居中，避免残留一个越界的偏移
-        region = self._current_region()
-        if not region.is_inside(spec.source_width, spec.source_height):
-            self._set_region_internal(
-                center_region(
-                    spec.source_width, spec.source_height, region.width, region.height
-                )
-            )
+        self._fit_region_to_source(spec)
         if warning:
             self.backend_notice.emit(warning)
             self.notice.emit("warn", warning)
@@ -302,6 +298,19 @@ class EchoApp(QObject):
         self.config_changed.emit()
         self.preconditions_changed.emit()
         return True, warning
+
+    def _fit_region_to_source(self, spec: SourceSpec) -> None:
+        """换源/恢复源后把选区收回新源范围内（见 region.fit_region_to_source）。
+
+        pipeline.set_source 已经对它自己的选区做过同样的收缩；这里把配置里
+        的选区也收一遍并推回 pipeline，保证配置、pipeline、界面三处一致。
+        """
+        fitted = fit_region_to_source(
+            spec.source_width, spec.source_height, self._current_region()
+        )
+        if fitted != self._current_region():
+            self._set_region_internal(fitted)
+            self._apply_region_to_pipeline(announce=False)
 
     def _sync_backend_from_pipeline(self) -> None:
         if self.pipeline.backend_key:

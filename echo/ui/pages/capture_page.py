@@ -68,6 +68,10 @@ class _IntField(QLineEdit):
 class CapturePage(QWidget):
     """采集主页面。"""
 
+    # 主按钮因前置条件不满足而禁用时发出，主窗口把它显示在顶栏说明位上，
+    # 避免用户只看到灰色按钮却不知道原因（tooltip 太隐蔽）。
+    block_reason = Signal(str)
+
     def __init__(self, app: app_mod.EchoApp, parent: QWidget | None = None):
         super().__init__(parent)
         self.app = app
@@ -556,6 +560,10 @@ class CapturePage(QWidget):
         )
         if not self.btn_primary.isEnabled():
             tooltip = f"无法开始：{problems[0]}"
+            # 原因同步到顶栏说明位，光看灰色按钮猜不出为什么。
+            # 保存异常态下面会把按钮重新启用，这里不抢着报原因。
+            if self.app.pipeline.state is not CaptureState.SAVE_ERROR:
+                self.block_reason.emit(f"无法开始：{problems[0]}")
         self.btn_primary.setToolTip(tooltip)
 
         if self.app.pipeline.state is CaptureState.SAVE_ERROR:

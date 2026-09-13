@@ -205,6 +205,20 @@ def center_region(source_width: int, source_height: int, width: int, height: int
     return Region(max(0, left), max(0, top), width, height)
 
 
+def fit_region_to_source(source_width: int, source_height: int, region: Region) -> Region:
+    """把选区收回采集源范围内，换源/恢复源后调用。
+
+    只居中不收缩会留下一个永久越界的选区：选区尺寸本身大于采集源时
+    validate_size 一直拦截，采集永远无法开始。这里先把宽高收缩到源内
+    （不低于 MIN_SIDE），再按新源重新居中；本就在源内的选区原样返回。
+    """
+    if region.is_inside(source_width, source_height):
+        return region
+    width = max(MIN_SIDE, min(region.width, max(MIN_SIDE, source_width)))
+    height = max(MIN_SIDE, min(region.height, max(MIN_SIDE, source_height)))
+    return center_region(source_width, source_height, width, height)
+
+
 def apply_ratio_lock(
     width: int,
     height: int,

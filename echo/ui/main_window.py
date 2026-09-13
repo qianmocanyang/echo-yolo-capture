@@ -256,6 +256,7 @@ class MainWindow(QMainWindow):
 
         self.capture_page.drag_requested.connect(self._on_drag_requested)
         self.capture_page.pick_directory_requested.connect(self._on_pick_directory)
+        self.capture_page.block_reason.connect(self._on_block_reason)
 
         # 拖拽定位期间暂停预览刷新意义不大，但要让遮罩拿到焦点
         self._overlay: RegionPickerOverlay | None = None
@@ -278,6 +279,11 @@ class MainWindow(QMainWindow):
     # ==================================================================
     # 状态
     # ==================================================================
+    def _on_block_reason(self, text: str) -> None:
+        """主按钮被前置条件禁用时，把原因写在顶栏说明位上（warn 色）。"""
+        self.state_reason.setText(text)
+        self.state_reason.setStyleSheet(f"color: {level_colors('warn')[0]};")
+
     def _on_state(self, state_value: str, reason: str) -> None:
         try:
             state = CaptureState(state_value)
