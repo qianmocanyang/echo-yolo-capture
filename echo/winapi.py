@@ -68,6 +68,10 @@ MONITOR_DEFAULTTONEAREST = 2
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 ERROR_HOTKEY_ALREADY_REGISTERED = 1409
 
+# OpenProcessToken / GetTokenInformation
+TOKEN_QUERY = 0x0008
+TOKEN_ELEVATION = 20
+
 
 # --------------------------------------------------------------------------
 # 结构体
@@ -128,6 +132,8 @@ WNDENUMPROC = WINFUNCTYPE(c_int, HWND, LPARAM)
 if IS_WINDOWS:
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
     try:
         dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
     except OSError:  # pragma: no cover
@@ -137,7 +143,7 @@ if IS_WINDOWS:
     except OSError:  # pragma: no cover
         shcore = None
 else:  # pragma: no cover
-    user32 = kernel32 = dwmapi = shcore = None
+    user32 = kernel32 = dwmapi = shcore = advapi32 = shell32 = None
 
 
 def _bind() -> None:
@@ -227,6 +233,19 @@ def _bind() -> None:
 
     kernel32.GetCurrentProcessId.argtypes = []
     kernel32.GetCurrentProcessId.restype = DWORD
+
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, DWORD, POINTER(wintypes.HANDLE)
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, c_int, c_void_p, DWORD, POINTER(DWORD)
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+
+    shell32.IsUserAnAdmin.argtypes = []
+    shell32.IsUserAnAdmin.restype = wintypes.BOOL
 
     if dwmapi is not None:
         dwmapi.DwmGetWindowAttribute.argtypes = [HWND, DWORD, c_void_p, DWORD]
@@ -599,3 +618,63 @@ def client_rect_on_screen(hwnd: int) -> tuple[int, int, int, int]:
     if not user32.ClientToScreen(HWND(hwnd), byref(origin)):
         raise OSError("ClientToScreen 失败")
     return (origin.x, origin.y, origin.x + (rect.right - rect.left), origin.y + (rect.bottom - rect.top))
+
+
+# --------------------------------------------------------------------------
+# 进程提权状态（用于解释 WGC「Failed to convert item」）
+# --------------------------------------------------------------------------
+
+def is_self_elevated() -> bool:
+    """本进程是否以管理员令牌运行。"""
+    if not IS_WINDOWS:
+        return False
+    try:
+        return bool(shell32.IsUserAnAdmin())
+    except Exception:  # pragma: no cover
+        return False
+
+
+def is_process_elevated(pid: int) -> bool:
+    """目标进程是否以管理员令牌运行。
+
+    ``PROCESS_QUERY_LIMITED_INFORMATION`` 跨提权也能打开，所以这里对
+    提权过的进程同样查得到。查不到（句柄/令牌失败）时返回 False，
+    按「无权限冲突」处理——宁可少提示，也不能误报。
+    """
+    if not IS_WINDOWS or pid <= 0:
+        return False
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    token = wintypes.HANDLE()
+    try:
+        if not advapi32.OpenProcessToken(handle, TOKEN_QUERY, byref(token)):
+            return False
+        elevation = DWORD(0)
+        returned = DWORD(0)
+        if not advapi32.GetTokenInformation(
+            token, TOKEN_ELEVATION, byref(elevation),
+            sizeof(DWORD), byref(returned),
+        ):
+            return False
+        return bool(elevation.value)
+    except Exception:  # pragma: no cover
+        log.exception("查询进程提权状态失败 pid=%s", pid)
+        return False
+    finally:
+        if token:
+            kernel32.CloseHandle(token)
+        kernel32.CloseHandle(handle)
+
+
+def window_elevation_conflict(hwnd: int) -> bool:
+    """目标窗口的进程提权而本进程未提权——Windows 禁止这种跨权限捕获。"""
+    if not IS_WINDOWS or not hwnd:
+        return False
+    pid = DWORD(0)
+    user32.GetWindowThreadProcessId(HWND(hwnd), byref(pid))
+    if not pid.value:
+        return False
+    if is_self_elevated():
+        return False
+    return is_process_elevated(pid.value)

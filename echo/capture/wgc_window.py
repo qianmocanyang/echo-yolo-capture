@@ -137,11 +137,6 @@ class WgcBackend(CaptureBackend):
             # 加了之后到底选中哪块屏，由打开时的帧尺寸校验确认，不靠假设。
             kwargs["monitor_index"] = int(source.monitor_index) + 1
 
-        try:
-            capture = WindowsCapture(**kwargs)
-        except Exception as exc:
-            raise CaptureError(f"创建 WGC 捕获对象失败：{exc}") from exc
-
         # 注意：windows_capture 的 event() 是按函数的 __name__ 分派的，
         # 所以这两个局部函数的**名字不能改**。
         def on_frame_arrived(frame, _control):  # noqa: N802
@@ -156,15 +151,44 @@ class WgcBackend(CaptureBackend):
                 self._cond.notify_all()
             log.info("WGC 捕获会话被系统关闭（窗口可能已销毁）")
 
-        capture.event(on_frame_arrived)
-        capture.event(on_closed)
-        self._capture = capture
-
-        try:
-            self._control = capture.start_free_threaded()
-        except Exception as exc:
-            self._capture = None
-            raise CaptureError(f"启动 WGC 捕获线程失败：{exc}", recoverable=True) from exc
+        # 两轮尝试：先按用户想要的无边框开；失败且报的是「边框」问题时，
+        # 退回带边框模式再试一次——旧版 Windows 10 没有 SetBorderRequired
+        # 这个 API（报 "Toggling the capture border is not supported"），
+        # 那台机器上 WGC 因此整体不可用。带边框只影响画面外观，不影响数据。
+        last_error: Exception | None = None
+        for draw_border in (False, True):
+            kwargs["draw_border"] = draw_border
+            try:
+                capture = WindowsCapture(**kwargs)
+            except Exception as exc:
+                raise CaptureError(f"创建 WGC 捕获对象失败：{exc}") from exc
+            capture.event(on_frame_arrived)
+            capture.event(on_closed)
+            self._capture = capture
+            try:
+                self._control = capture.start_free_threaded()
+            except Exception as exc:
+                self._capture = None
+                self._control = None
+                last_error = exc
+                lowered = str(exc).lower()
+                if draw_border is False and "border" in lowered:
+                    log.warning(
+                        "系统不支持关闭 WGC 捕获边框，退回带边框模式重试：%s", exc
+                    )
+                    continue
+                raise CaptureError(
+                    self._friendly_start_error(str(exc), source), recoverable=True
+                ) from exc
+            else:
+                if draw_border:
+                    log.info("当前系统以带边框模式运行 WGC（不支持关闭捕获边框）")
+                break
+        else:  # pragma: no cover - 两轮都失败且都报边框，基本不会发生
+            raise CaptureError(
+                self._friendly_start_error(str(last_error or "WGC 启动失败"), source),
+                recoverable=True,
+            )
 
         # 等首帧，用它校验帧尺寸与客户区的关系。
         if not self._wait_first_frame(FIRST_FRAME_TIMEOUT):
@@ -181,6 +205,34 @@ class WgcBackend(CaptureBackend):
             "WGC 已就绪：%s | 帧尺寸 %s×%s | 客户区偏移 %s",
             source.kind.label, source.source_width, source.source_height, self._client_offset,
         )
+
+    def _friendly_start_error(self, text: str, source: SourceSpec) -> str:
+        """把 windows-capture 的原始报错翻译成用户能动手处理的提示。
+
+        「Failed to convert item to 'GraphicsCaptureItem'」这个报错本身毫无
+        信息量，但它最常见的触发条件是：目标程序以管理员运行、本工具没有，
+        Windows 禁止跨完整性级别捕获。这种情况能在本地查证，查到了就说准话。
+        """
+        lowered = text.lower()
+        if "convert item" in lowered or "graphicscaptureitem" in lowered:
+            if source.kind is SourceKind.WINDOW and winapi.window_elevation_conflict(source.hwnd):
+                return (
+                    f"无法捕获窗口「{source.label}」：该程序以管理员身份运行，"
+                    "而本工具没有管理员权限，Windows 不允许跨权限捕获画面。"
+                    "请右键本工具选择「以管理员身份运行」后再试。"
+                )
+            if source.kind is SourceKind.WINDOW:
+                return (
+                    f"无法捕获窗口「{source.label}」：Windows 拒绝将该窗口交给捕获系统。"
+                    "常见原因：受保护内容或系统窗口、窗口正在最小化/刚销毁、"
+                    "游戏加了反作弊保护。可改用「显示器」模式采集整屏，"
+                    "或把游戏设为无边框窗口后重试。"
+                )
+            return (
+                f"无法捕获该显示器：{text}。"
+                "请改用 DXGI 显示器捕获后端（设置页可切换）。"
+            )
+        return text
 
     def _wait_first_frame(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
