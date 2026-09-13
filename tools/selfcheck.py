@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -23,6 +24,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PYTHON = sys.executable
+
+# 强制 UTF-8。所有检查脚本都要打印中文，而 Windows 上 Python 的 stdout 默认跟随
+# 本地代码页——英文环境是 cp1252，打印中文直接 UnicodeEncodeError 崩掉（退出码 1），
+# 看起来像「检查没通过」。CI 在 windows-latest 上就是这么挂的。
+# setdefault 会让下面 spawn 的 5 个子进程一并继承，一处设置覆盖全部。
+os.environ.setdefault("PYTHONUTF8", "1")
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 CHECKS = [
     ("静态属性扫描", "tools/check_attrs.py", True),

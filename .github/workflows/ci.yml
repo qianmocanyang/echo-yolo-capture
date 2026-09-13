@@ -17,6 +17,12 @@ jobs:
     name: 四道检查
     runs-on: windows-latest
 
+    # runner 是英文 Windows，本地代码页 cp1252，而 Python 的 stdout 默认跟随本地
+    # 代码页 —— 脚本一打印中文就 UnicodeEncodeError，退出码 1，看起来像「检查没通过」。
+    # 开 UTF-8 模式一次解决，本地跑则靠 tools/selfcheck.py 里的同名设置。
+    env:
+      PYTHONUTF8: "1"
+
     steps:
       - uses: actions/checkout@v4
 
