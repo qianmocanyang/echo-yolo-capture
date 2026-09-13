@@ -726,3 +726,40 @@ def recycle_paths(paths: list[str]) -> tuple[bool, str]:
     if op.fAnyOperationsAborted:
         return False, "部分文件未能移入回收站"
     return True, ""
+
+
+# --------------------------------------------------------------------------
+# Windows 版本检测（用于 WGC 边框 API 的能力判断）
+# --------------------------------------------------------------------------
+
+class OSVERSIONINFOW(ctypes.Structure):
+    _fields_ = [
+        ("dwOSVersionInfoSize", DWORD),
+        ("dwMajorVersion", DWORD),
+        ("dwMinorVersion", DWORD),
+        ("dwBuildNumber", DWORD),
+        ("dwPlatformId", DWORD),
+        ("szCSDVersion", ctypes.c_wchar * 128),
+    ]
+
+
+if IS_WINDOWS:
+    # RtlGetVersion 不受应用清单兼容性声明影响，返回真实版本；
+    # GetVersionExW 在无清单时会被系统"降级"成 6.2，不能用来判断能力。
+    _ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    _ntdll.RtlGetVersion.argtypes = [ctypes.POINTER(OSVERSIONINFOW)]
+    _ntdll.RtlGetVersion.restype = DWORD
+
+
+def windows_build() -> int:
+    """返回真实的 Windows build 号（如 Win10 21H2=19044、Win11=22000）。
+
+    查询失败返回 0，调用方应按"未知"处理，走保守路径。
+    """
+    if not IS_WINDOWS:
+        return 0
+    info = OSVERSIONINFOW()
+    info.dwOSVersionInfoSize = ctypes.sizeof(OSVERSIONINFOW)
+    if _ntdll.RtlGetVersion(ctypes.byref(info)) != 0:
+        return 0
+    return int(info.dwBuildNumber)

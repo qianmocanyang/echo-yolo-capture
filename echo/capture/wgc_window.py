@@ -41,6 +41,18 @@ BACKEND_NAME = "Windows Graphics Capture"
 # 打开后等待首帧的上限。首帧是校验帧尺寸的唯一依据，等不到就不能认为打开成功。
 FIRST_FRAME_TIMEOUT = 3.0
 
+# GraphicsCaptureSession.SetBorderRequired（关边框用的 API）是 Windows 11
+# (build 22000) / Windows Server 2022 (20348) 才有的；更旧的 Windows 10 上一
+# 调就报 "Toggling the capture border is not supported"。且 windows-capture
+# 的这个异常发生在**后台捕获线程**里（start_free_threaded 正常返回，
+# Python 层拿不到），两轮重试根本等不到——所以必须在这里提前按版本避开。
+BORDER_TOGGLE_MIN_BUILD = 20348
+
+
+def border_toggle_supported(build: int) -> bool:
+    """build 号是否支持关闭捕获边框。0（查询失败）按不支持处理，走保守路径。"""
+    return build >= BORDER_TOGGLE_MIN_BUILD
+
 
 def capability() -> BackendCapability:
     notes = [
@@ -151,12 +163,18 @@ class WgcBackend(CaptureBackend):
                 self._cond.notify_all()
             log.info("WGC 捕获会话被系统关闭（窗口可能已销毁）")
 
-        # 两轮尝试：先按用户想要的无边框开；失败且报的是「边框」问题时，
-        # 退回带边框模式再试一次——旧版 Windows 10 没有 SetBorderRequired
-        # 这个 API（报 "Toggling the capture border is not supported"），
-        # 那台机器上 WGC 因此整体不可用。带边框只影响画面外观，不影响数据。
+        # 旧系统（Win10）直接跳过无边框尝试：SetBorderRequired 不存在，
+        # 无边框模式会在后台线程里失败而我们拿不到异常，只能预防。
+        if border_toggle_supported(winapi.windows_build()):
+            attempts: tuple[bool, ...] = (False, True)
+        else:
+            attempts = (True,)
+            log.info("Windows build < %d，不支持关闭 WGC 捕获边框，直接以带边框模式运行", BORDER_TOGGLE_MIN_BUILD)
+
+        # 两轮尝试兜底：万一版本判断有漏网（如查询失败但实际是新系统），
+        # 报错里带 "border" 就退回带边框模式再试一次。
         last_error: Exception | None = None
-        for draw_border in (False, True):
+        for draw_border in attempts:
             kwargs["draw_border"] = draw_border
             try:
                 capture = WindowsCapture(**kwargs)
