@@ -19,6 +19,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QSize, Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSizePolicy,
@@ -36,6 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from ... import app as app_mod
+from ... import winapi
 from ...dataset import (
     collect_items,
     import_labels,
@@ -72,6 +75,7 @@ class _GridCell(QWidget):
 
     toggled = Signal(int, bool)     # image_id, checked
     opened = Signal(object)         # row
+    menu_requested = Signal(object, object)  # row, 全局坐标 QPoint
 
     def __init__(self, row, abs_path: Path, parent: QWidget | None = None):
         super().__init__(parent)
@@ -153,6 +157,9 @@ class _GridCell(QWidget):
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
         self.opened.emit(self.row)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        self.menu_requested.emit(self.row, event.globalPos())
 
 
 class _Worker(QObject):
@@ -309,6 +316,13 @@ class LibraryPage(QWidget):
             )
         row.addWidget(self._button("全选本页", lambda: self._select_all(True)))
         row.addWidget(self._button("取消选择", lambda: self._select_all(False)))
+        row.addWidget(self._button("复制路径", self._copy_paths, icon="duplicate"))
+        row.addWidget(self._button("打开位置", self._open_selected_location, icon="folder_open"))
+        self.btn_delete = self._button(
+            "删除选中", self._delete_selected, icon="trash", variant="danger"
+        )
+        self.btn_delete.setToolTip("图片文件移入系统回收站，可在回收站还原")
+        row.addWidget(self.btn_delete)
         actions.add_layout(row)
         box.addWidget(actions)
         return holder
@@ -550,6 +564,7 @@ class LibraryPage(QWidget):
             cell = _GridCell(row, layout.absolute(row["rel_path"]), self.grid_holder)
             cell.toggled.connect(self._on_cell_toggled)
             cell.opened.connect(lambda r: self.app.reveal_file(str(layout.absolute(r["rel_path"]))))
+            cell.menu_requested.connect(self._on_cell_menu)
             self.grid.addWidget(cell, index // columns, index % columns)
             self._cells.append(cell)
 
@@ -602,6 +617,162 @@ class LibraryPage(QWidget):
             self.app.notice.emit("error", f"更新审核状态失败：{exc}")
             return
         self.app.notice.emit("info", f"已把 {len(ids)} 张图标记为「{status.label}」")
+        self.refresh()
+
+    # ==================================================================
+    # 删除 / 定位 / 复制路径
+    # ==================================================================
+    def _selected_paths(self) -> list[tuple[int, Path]]:
+        """选中图片的 (image_id, 绝对路径) 列表，记录已删的自动跳过。"""
+        db, layout = self.app.db(), self.app.layout()
+        if db is None or layout is None:
+            return []
+        pairs: list[tuple[int, Path]] = []
+        for image_id in sorted(self._selected):
+            try:
+                row = db.get_image(image_id)
+            except Exception:
+                row = None
+            if row is not None:
+                pairs.append((image_id, layout.absolute(row["rel_path"])))
+        return pairs
+
+    def _copy_paths(self) -> None:
+        pairs = self._selected_paths()
+        if not pairs:
+            self.app.notice.emit("warn", "请先勾选要复制的图片")
+            return
+        text = "\n".join(str(path) for _id, path in pairs)
+        QApplication.clipboard().setText(text)
+        self.app.notice.emit("info", f"已复制 {len(pairs)} 个路径")
+
+    def _open_selected_location(self) -> None:
+        pairs = self._selected_paths()
+        if not pairs:
+            self.app.notice.emit("warn", "请先勾选图片")
+            return
+        self.app.reveal_file(str(pairs[0][1]))
+
+    def _delete_paths_to_trash(self, paths: list[Path]) -> bool:
+        """把文件移入回收站。失败时提示并返回 False（数据库不动）。"""
+        if not paths:
+            return True
+        ok, message = winapi.recycle_paths([str(p) for p in paths])
+        if not ok:
+            self.app.notice.emit("error", f"{message}，已取消删除")
+        return ok
+
+    def _delete_selected(self) -> None:
+        db = self.app.db()
+        pairs = self._selected_paths()
+        if db is None or not pairs:
+            self.app.notice.emit("warn", "请先勾选要删除的图片")
+            return
+        missing = len(self._selected) - len(pairs)
+        answer = QMessageBox.question(
+            self,
+            "删除图片",
+            f"确定删除选中的 {len(pairs)} 张图片吗？\n\n"
+            "· 图片文件会移入系统回收站，误删可在回收站还原\n"
+            "· 对应的数据库记录会一并删除，导出时不再包含\n"
+            "· 已有的标注文件不会被删除，但失去原图后导出会跳过"
+            + (f"\n\n另有 {missing} 条记录已失效，将只清理索引。" if missing else ""),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        paths = [path for _id, path in pairs]
+        if not self._delete_paths_to_trash(paths):
+            return
+        ids = [image_id for image_id, _path in pairs]
+        try:
+            removed = db.delete_images(ids)
+        except Exception as exc:
+            self.app.notice.emit("error", f"删除数据库记录失败：{exc}")
+            return
+        self._selected.clear()
+        self._update_selection_label()
+        self.app.notice.emit(
+            "info", f"已删除 {len(removed)} 张图片，文件在回收站可还原"
+        )
+        self.refresh()
+
+    def _on_cell_menu(self, row, global_pos) -> None:
+        """单张图的右键菜单：定位、复制路径、状态标记、删除。"""
+        layout = self.app.layout()
+        image_id = int(row["id"])
+        menu = QMenu(self)
+        if layout is not None:
+            abs_path = layout.absolute(row["rel_path"])
+            menu.addAction(
+                icons.qicon("folder_open", DARK.text_dim, 14),
+                "在文件夹中显示",
+                lambda: self.app.reveal_file(str(abs_path)),
+            )
+        menu.addAction(
+            icons.qicon("duplicate", DARK.text_dim, 14),
+            "复制文件路径",
+            lambda: QApplication.clipboard().setText(str(layout.absolute(row["rel_path"])))
+            if layout is not None
+            else None,
+        )
+        menu.addSeparator()
+
+        def mark(status: ReviewStatus) -> None:
+            db = self.app.db()
+            if db is None:
+                return
+            try:
+                db.set_review_status([image_id], status)
+            except Exception as exc:
+                self.app.notice.emit("error", f"更新审核状态失败：{exc}")
+                return
+            self.refresh()
+
+        status_menu = menu.addMenu("标记为")
+        for status in ReviewStatus:
+            status_menu.addAction(status.label, lambda s=status: mark(s))
+
+        menu.addSeparator()
+        menu.addAction(
+            icons.qicon("trash", DARK.danger, 14),
+            "删除（移入回收站）",
+            lambda: self._delete_one(image_id),
+        )
+        menu.exec(global_pos)
+
+    def _delete_one(self, image_id: int) -> None:
+        db, layout = self.app.db(), self.app.layout()
+        if db is None:
+            return
+        try:
+            row = db.get_image(image_id)
+        except Exception:
+            row = None
+        if row is None:
+            return
+        name = Path(str(row["rel_path"])).name
+        answer = QMessageBox.question(
+            self,
+            "删除图片",
+            f"确定删除 {name} 吗？\n文件会移入系统回收站，可在回收站还原。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        if layout is not None:
+            abs_path = layout.absolute(row["rel_path"])
+            if abs_path.exists() and not self._delete_paths_to_trash([abs_path]):
+                return
+        try:
+            db.delete_images([image_id])
+        except Exception as exc:
+            self.app.notice.emit("error", f"删除数据库记录失败：{exc}")
+            return
+        self._selected.discard(image_id)
+        self.app.notice.emit("info", f"已删除 {name}")
         self.refresh()
 
     # ==================================================================

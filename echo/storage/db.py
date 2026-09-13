@@ -343,16 +343,17 @@ class Database:
         with self._lock:
             return self._conn.execute(
                 """
-                SELECT COALESCE(s.session_uid, i.session_uid) AS session_uid,
+                SELECT COALESCE(s.session_uid, d.session_uid) AS session_uid,
                        s.started_at,
                        COALESCE(s.source_label, '') AS source_label,
                        COALESCE(s.backend, '') AS backend,
                        COUNT(i.id) AS n_images,
                        SUM(CASE WHEN i.review_status='labeled' THEN 1 ELSE 0 END) AS n_labeled,
                        SUM(CASE WHEN i.review_status='excluded' THEN 1 ELSE 0 END) AS n_excluded
-                FROM (SELECT DISTINCT session_uid FROM images) i
-                LEFT JOIN sessions s ON s.session_uid = i.session_uid
-                GROUP BY COALESCE(s.session_uid, i.session_uid)
+                FROM (SELECT DISTINCT session_uid FROM images) d
+                LEFT JOIN sessions s ON s.session_uid = d.session_uid
+                LEFT JOIN images i ON i.session_uid = d.session_uid
+                GROUP BY COALESCE(s.session_uid, d.session_uid)
                 ORDER BY COALESCE(s.started_at, '') DESC, session_uid DESC
                 """
             ).fetchall()
@@ -531,6 +532,21 @@ class Database:
             self._conn.execute("DELETE FROM images WHERE id=?", (int(image_id),))
             self._conn.commit()
         return row
+
+    def delete_images(self, image_ids: Iterable[int]) -> list[sqlite3.Row]:
+        """批量删索引，不删文件。返回被删的行（含 rel_path，供上层处理文件）。"""
+        rows: list[sqlite3.Row] = []
+        with self._lock:
+            for image_id in dict.fromkeys(int(i) for i in image_ids):
+                row = self._conn.execute(
+                    "SELECT * FROM images WHERE id=?", (image_id,)
+                ).fetchone()
+                if row is None:
+                    continue
+                self._conn.execute("DELETE FROM images WHERE id=?", (image_id,))
+                rows.append(row)
+            self._conn.commit()
+        return rows
 
     def count_images(self, session_uid: str | None = None) -> int:
         with self._lock:

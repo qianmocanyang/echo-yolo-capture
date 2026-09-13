@@ -72,6 +72,12 @@ ERROR_HOTKEY_ALREADY_REGISTERED = 1409
 TOKEN_QUERY = 0x0008
 TOKEN_ELEVATION = 20
 
+# SHFileOperationW：把文件移入回收站
+FO_DELETE = 3
+FOF_SILENT = 0x0004
+FOF_NOCONFIRMATION = 0x0010
+FOF_ALLOWUNDO = 0x0040
+
 
 # --------------------------------------------------------------------------
 # 结构体
@@ -123,6 +129,21 @@ class MSG(Structure):
 
 MONITORENUMPROC = WINFUNCTYPE(c_int, HWND, HWND, POINTER(RECT), LPARAM)
 WNDENUMPROC = WINFUNCTYPE(c_int, HWND, LPARAM)
+
+
+class SHFILEOPSTRUCTW(Structure):
+    """SHFileOperationW 的参数块（pFrom 必须是双 NUL 结尾的多路径串）。"""
+
+    _fields_ = [
+        ("hwnd", HWND),
+        ("wFunc", c_uint),
+        ("pFrom", POINTER(ctypes.c_wchar)),
+        ("pTo", POINTER(ctypes.c_wchar)),
+        ("fFlags", ctypes.c_ushort),
+        ("fAnyOperationsAborted", wintypes.BOOL),
+        ("hNameMappings", c_void_p),
+        ("lpszProgressTitle", ctypes.c_wchar_p),
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -678,3 +699,30 @@ def window_elevation_conflict(hwnd: int) -> bool:
     if is_self_elevated():
         return False
     return is_process_elevated(pid.value)
+
+
+def recycle_paths(paths: list[str]) -> tuple[bool, str]:
+    """把一组文件移入系统回收站（可还原），返回 (是否全部成功, 说明)。
+
+    用 SHFileOperationW 而不是 os.remove——数据集图片是用户辛苦采的，
+    误删要能从回收站找回来。pFrom 需要双 NUL 结尾的多路径串，
+    ctypes 的 c_wchar_p 会在第一个 NUL 截断，所以用缓冲区 + 指针。
+    """
+    if not paths:
+        return True, ""
+    if not IS_WINDOWS or shell32 is None:  # pragma: no cover
+        return False, "当前系统不支持回收站操作"
+    # 路径列表以单 NUL 分隔、双 NUL 结尾
+    joined = "\0".join(str(p) for p in paths)
+    buffer = ctypes.create_unicode_buffer(joined, len(joined) + 2)
+    buffer[len(joined) + 1] = "\0"  # 显式双 NUL 结尾
+    op = SHFILEOPSTRUCTW()
+    op.wFunc = FO_DELETE
+    op.pFrom = ctypes.cast(buffer, POINTER(ctypes.c_wchar))
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT
+    code = shell32.SHFileOperationW(byref(op))
+    if code != 0:
+        return False, f"移入回收站失败（错误码 {code}）"
+    if op.fAnyOperationsAborted:
+        return False, "部分文件未能移入回收站"
+    return True, ""
