@@ -4,7 +4,7 @@
 去重标记、标注导入、YOLO 导出），P2（内置标注编辑器、模型预标注）留出扩展点。
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 APP_NAME = "echo"
 APP_DISPLAY_NAME = "echo"

@@ -1,0 +1,34 @@
+name: 发布 Release
+
+# 推送 v* 标签时自动创建 GitHub Release（正文用合并的提交说明生成）。
+# exe 在本地打包分发（依赖 dxcam / windows-capture 的 Windows 专属行为，
+# CI 里打包无法验证启动，故不自动附带产物）。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 创建 Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验标签与 __version__ 一致
+        run: |
+          version=$(grep -oP '(?<=__version__ = ")[^"]+' echo/__init__.py)
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "标签 v$tag 与 __version__ $version 不一致"
+            exit 1
+          fi
+          echo "发布版本：$version"
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
