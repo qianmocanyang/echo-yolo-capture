@@ -1,0 +1,22 @@
+# echo 运行依赖（Windows 10 2004+ / Windows 11）
+#
+# 安装：
+#     python -m venv .venv
+#     .venv\Scripts\pip install -r requirements.txt
+#
+# Python 需 3.10+（代码用了 `X | None` 与 dataclass slots）；实测环境为 3.13。
+
+# ---- 直接依赖 -------------------------------------------------------------
+PySide6==6.8.3              # Qt6 界面。pip 会自动带上 PySide6_Essentials/Addons
+numpy==2.2.6                # 帧缓冲与图像数组
+opencv-python==4.12.0.88    # PNG 编解码（走 imencode/imdecode 以兼容中文路径）
+dxcam==0.3.0                # DXGI Desktop Duplication —— 显示器捕获后端
+windows-capture==2.0.1      # Windows.Graphics.Capture —— 窗口捕获后端
+pywin32==311                # Win32：DPI 声明、显示器/窗口枚举、RegisterHotKey
+psutil==7.2.2               # 取进程名，窗口列表里显示所属游戏
+
+# ---- 传递依赖（由上面自动安装，锁版本仅为复现） ---------------------------
+# comtypes==1.4.16          # dxcam 用它动态生成 COM 包装
+# shiboken6==6.8.3          # PySide6 依赖
+# PySide6_Essentials==6.8.3
+# PySide6_Addons==6.8.3

@@ -1,0 +1,48 @@
+name: 自检
+
+# 这个项目是 Windows 专用工具（依赖 DXGI / Windows.Graphics.Capture / RegisterHotKey），
+# 所以 CI 也跑在 Windows 上——在 Linux 上跑只能验证「语法没写错」，意义有限。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  selfcheck:
+    name: 四道检查
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 语法合法、导入也通过，但 self.xxx 根本没定义的成员——
+      # 只有运行时真走到那一行才炸，静态扫一遍最省事。
+      - name: 静态属性扫描
+        run: python tools/check_attrs.py --strict
+
+      - name: 模块导入（含 Qt 与采集后端）
+        run: python tools/selfcheck_imports.py
+
+      # 选区计算、标注坐标换算、划分防泄漏、原子写盘、DB 往返。
+      # 这些错了不会崩，但会让数据集不可信。
+      - name: 业务逻辑用例
+        run: python tests/test_logic.py
+
+      # 用 Qt offscreen 插件真实构造窗口并跑事件循环，覆盖控件构造与信号连接。
+      - name: 界面冒烟
+        run: python tools/smoke_ui.py

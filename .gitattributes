@@ -1,0 +1,24 @@
+# 统一换行符：仓库内一律 LF，检出到 Windows 时脚本与文本仍为 LF。
+# 这个项目只在 Windows 上跑，但代码本身是跨平台的纯 Python，
+# 保持 LF 可以让 diff 干净、避免「整文件都是改动」的假象。
+* text=auto eol=lf
+
+# Windows 专用脚本若要检出为 CRLF，在这里单独声明（当前没有）
+# *.bat text eol=crlf
+# *.ps1 text eol=crlf
+
+# 二进制资源，别做行尾转换也别当文本 diff
+*.png binary
+*.ico binary
+*.jpg binary
+*.db binary
+*.zip binary
+*.exe binary
+*.dll binary
+*.pyd binary
+
+# 锁文件与生成物：在 GitHub 上折叠显示，不污染 diff 统计
+requirements.txt linguist-generated=false
+echo.spec linguist-language=Python
+tools/*.py linguist-language=Python
+tests/*.py linguist-language=Python
