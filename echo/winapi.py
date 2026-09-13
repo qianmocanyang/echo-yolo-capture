@@ -12,10 +12,12 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import sys
 from ctypes import POINTER, Structure, WINFUNCTYPE, byref, c_int, c_uint, c_void_p, sizeof
 from ctypes import wintypes
 from dataclasses import dataclass
+from pathlib import Path
 
 from .logging_setup import get_logger
 
@@ -77,6 +79,7 @@ FO_DELETE = 3
 FOF_SILENT = 0x0004
 FOF_NOCONFIRMATION = 0x0010
 FOF_ALLOWUNDO = 0x0040
+FOF_NOERRORUI = 0x0400
 
 
 # --------------------------------------------------------------------------
@@ -701,31 +704,91 @@ def window_elevation_conflict(hwnd: int) -> bool:
     return is_process_elevated(pid.value)
 
 
-def recycle_paths(paths: list[str]) -> tuple[bool, str]:
-    """把一组文件移入系统回收站（可还原），返回 (是否全部成功, 说明)。
+def recycle_paths(paths: list[str]) -> tuple[list[str], list[str], str]:
+    """把一组文件移入系统回收站（可还原）。
 
-    用 SHFileOperationW 而不是 os.remove——数据集图片是用户辛苦采的，
-    误删要能从回收站找回来。pFrom 需要双 NUL 结尾的多路径串，
-    ctypes 的 c_wchar_p 会在第一个 NUL 截断，所以用缓冲区 + 指针。
+    返回 ``(已成功移入回收站的路径, 磁盘上已不存在的路径, 失败说明)``。
+    失败说明为空串表示全部成功（或没有可删的文件）。
+
+    设计要点（都是踩过坑的）：
+    - SHFileOperationW 是"全有或全无"：路径串里混进一个失效路径
+      （文件已被手动删掉/移动、相对路径、超长路径）会让整个批次报
+      DE_INVALIDFILES（124），一张都删不掉。所以先按 ``os.path.exists``
+      把失效路径分拣出去，再对存在的文件做操作。
+    - 批量失败时逐个重试隔离出罪魁祸首，其余文件照常删——
+      一张锁定文件不应该挡住其余 199 张。
+    - pFrom 需要双 NUL 结尾的多路径串；ctypes 的 c_wchar_p 会在第一个
+      NUL 截断，所以用缓冲区逐字符复制。
     """
+    recycled: list[str] = []
+    missing: list[str] = []
     if not paths:
-        return True, ""
+        return recycled, missing, ""
     if not IS_WINDOWS or shell32 is None:  # pragma: no cover
-        return False, "当前系统不支持回收站操作"
-    # 路径列表以单 NUL 分隔、双 NUL 结尾
-    joined = "\0".join(str(p) for p in paths)
-    buffer = ctypes.create_unicode_buffer(joined, len(joined) + 2)
-    buffer[len(joined) + 1] = "\0"  # 显式双 NUL 结尾
-    op = SHFILEOPSTRUCTW()
-    op.wFunc = FO_DELETE
-    op.pFrom = ctypes.cast(buffer, POINTER(ctypes.c_wchar))
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT
-    code = shell32.SHFileOperationW(byref(op))
-    if code != 0:
-        return False, f"移入回收站失败（错误码 {code}）"
-    if op.fAnyOperationsAborted:
-        return False, "部分文件未能移入回收站"
-    return True, ""
+        return recycled, list(paths), "当前系统不支持回收站操作"
+
+    todo: list[str] = []
+    for raw in paths:
+        absolute = os.path.abspath(str(raw))
+        if os.path.exists(absolute):
+            todo.append(absolute)
+        else:
+            missing.append(absolute)
+
+    def _shfo_delete(items: list[str]) -> int:
+        """执行一次批量删除，返回 SHFileOperationW 的错误码（0=成功）。"""
+        joined = "\0".join(items)
+        buffer = ctypes.create_unicode_buffer("\0" * (len(joined) + 2))
+        for index, char in enumerate(joined):
+            buffer[index] = char
+        op = SHFILEOPSTRUCTW()
+        op.wFunc = FO_DELETE
+        op.pFrom = ctypes.cast(buffer, POINTER(ctypes.c_wchar))
+        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+        code = shell32.SHFileOperationW(byref(op))
+        if code != 0:
+            return code
+        if op.fAnyOperationsAborted:
+            return -1  # 用户或系统中止，无具体码
+        return 0
+
+    if todo:
+        code = _shfo_delete(todo)
+        if code == 0:
+            recycled.extend(todo)
+        elif len(todo) == 1:
+            return recycled, missing, _recycle_error_text(code, todo[0])
+        else:
+            # 逐个重试，隔离出失败的那部分
+            for item in todo:
+                single = _shfo_delete([item])
+                if single == 0:
+                    recycled.append(item)
+                else:
+                    return recycled, missing, _recycle_error_text(single, item)
+    return recycled, missing, ""
+
+
+_RECYCLE_ERRORS = {
+    113: "源与目标是同一个文件",
+    116: "路径是根目录，不能删除",
+    117: "操作被中止",
+    122: "安全设置拒绝访问",
+    123: "路径超过系统长度限制",
+    124: "路径无效（文件可能已被移动、删除或被其他程序占用）",
+    126: "目标位置被文件占用",
+    128: "路径被文件夹占用",
+    129: "文件名超过系统长度限制",
+    130: "只读光盘或未格式化的盘，无法操作",
+}
+
+
+def _recycle_error_text(code: int, path: str) -> str:
+    name = Path(path).name
+    hint = _RECYCLE_ERRORS.get(code, f"系统返回错误码 {code}")
+    return f"「{name}」无法移入回收站：{hint}"
+
+
 
 
 # --------------------------------------------------------------------------

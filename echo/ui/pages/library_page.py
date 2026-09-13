@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QSize, Qt, QThread, Signal
@@ -653,15 +654,6 @@ class LibraryPage(QWidget):
             return
         self.app.reveal_file(str(pairs[0][1]))
 
-    def _delete_paths_to_trash(self, paths: list[Path]) -> bool:
-        """把文件移入回收站。失败时提示并返回 False（数据库不动）。"""
-        if not paths:
-            return True
-        ok, message = winapi.recycle_paths([str(p) for p in paths])
-        if not ok:
-            self.app.notice.emit("error", f"{message}，已取消删除")
-        return ok
-
     def _delete_selected(self) -> None:
         db = self.app.db()
         pairs = self._selected_paths()
@@ -682,20 +674,50 @@ class LibraryPage(QWidget):
         )
         if answer != QMessageBox.Yes:
             return
-        paths = [path for _id, path in pairs]
-        if not self._delete_paths_to_trash(paths):
+
+        # 先分拣：磁盘上已不在的记录只清索引（SHFileOperation 遇到失效
+        # 路径会整批报 124 且一张都不删，必须提前摘出来）
+        existing: list[tuple[int, Path]] = []
+        missing_ids: list[int] = []
+        for image_id, path in pairs:
+            if path.exists():
+                existing.append((image_id, path))
+            else:
+                missing_ids.append(image_id)
+
+        # 存在的文件送回收站；失败的保留记录，其余删除
+        ok_ids: list[int] = list(missing_ids)
+        deleted_files = 0
+        if existing:
+            recycled, _missing, error = winapi.recycle_paths(
+                [str(path) for _id, path in existing]
+            )
+            ok_norm = {os.path.normcase(p) for p in recycled}
+            ok_ids.extend(
+                image_id
+                for image_id, path in existing
+                if os.path.normcase(str(path)) in ok_norm
+            )
+            deleted_files = len(ok_norm)
+            failed = len(existing) - deleted_files
+            if failed:
+                self.app.notice.emit(
+                    "error",
+                    f"{failed} 张图片未能移入回收站，对应记录已保留。原因：{error}",
+                )
+        if not ok_ids:
             return
-        ids = [image_id for image_id, _path in pairs]
         try:
-            removed = db.delete_images(ids)
+            removed = db.delete_images(ok_ids)
         except Exception as exc:
             self.app.notice.emit("error", f"删除数据库记录失败：{exc}")
             return
-        self._selected.clear()
+        self._selected.difference_update(ok_ids)
         self._update_selection_label()
-        self.app.notice.emit(
-            "info", f"已删除 {len(removed)} 张图片，文件在回收站可还原"
-        )
+        parts = [f"已删除 {deleted_files} 张图片（回收站可还原）"]
+        if missing_ids:
+            parts.append(f"清理了 {len(missing_ids)} 条失效记录")
+        self.app.notice.emit("info", "；".join(parts))
         self.refresh()
 
     def _on_cell_menu(self, row, global_pos) -> None:
@@ -764,8 +786,13 @@ class LibraryPage(QWidget):
             return
         if layout is not None:
             abs_path = layout.absolute(row["rel_path"])
-            if abs_path.exists() and not self._delete_paths_to_trash([abs_path]):
-                return
+            if abs_path.exists():
+                recycled, _missing, error = winapi.recycle_paths([str(abs_path)])
+                if not recycled:
+                    self.app.notice.emit(
+                        "error", error or "文件未能移入回收站，已保留记录"
+                    )
+                    return
         try:
             db.delete_images([image_id])
         except Exception as exc:
