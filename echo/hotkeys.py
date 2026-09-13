@@ -89,6 +89,17 @@ PURE_MODIFIER_VKS = {
 # 这些键作为单键（无修饰）注册会被系统拒绝或意义不明，录制时就拦下来
 FORBIDDEN_SOLO = {"TAB", "ESC", "ESCAPE", "ENTER", "RETURN", "BACKSPACE", "DELETE", "DEL"}
 
+# RegisterHotKey 是**全局**的：注册裸字母/数字后，整个系统里按这个键
+# 都会被本工具截走——聊天、搜索框、游戏内输入全部打不出这个字。
+# 所以这些"常用输入键"不允许无修饰键单独注册，必须配合 Ctrl/Alt/Shift。
+# F 区、小键盘、方向键等不常用于打字的键仍允许单键（如默认的 F9）。
+TYPABLE_SOLO_VKS = frozenset(
+    [ord(c) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"]
+    + [0x20, 0xC0, 0xBD, 0xBB, 0xDB, 0xDD, 0xDC, 0xBA, 0xDE, 0xBC, 0xBE, 0xBF]  # 空格与标点
+)
+
+SOLO_TYPED_HINT = "请配合 Ctrl / Alt / Shift 使用（如 Ctrl+{key}），或改用 F 区 / 小键盘按键"
+
 
 def parse_combo(text: str) -> tuple[int, int, str]:
     """解析 "Ctrl+Alt+E" 这类组合键。
@@ -131,6 +142,8 @@ def parse_combo(text: str) -> tuple[int, int, str]:
 
     if mods == 0 and key_token in FORBIDDEN_SOLO:
         return 0, 0, f"「{key_token}」不能单独作为快捷键，请配合 Ctrl / Alt / Shift"
+    if mods == 0 and vk in TYPABLE_SOLO_VKS:
+        return 0, 0, f"「{key_token}」是常用输入键，单独注册会导致全局无法打字。{SOLO_TYPED_HINT.format(key=key_token)}"
 
     return mods, vk, ""
 
@@ -188,6 +201,9 @@ def combo_from_qt(modifiers, key: int) -> tuple[str, str]:
     token = _VK_TO_NAME.get(vk, "")
     if mods == 0 and token in FORBIDDEN_SOLO:
         return "", f"「{token}」不能单独作为快捷键，请配合 Ctrl / Alt / Shift"
+    if mods == 0 and vk in TYPABLE_SOLO_VKS:
+        display = token or chr(vk)
+        return "", f"「{display}」是常用输入键，单独注册会导致全局无法打字。{SOLO_TYPED_HINT.format(key=display)}"
 
     return format_combo(mods, vk), ""
 

@@ -67,6 +67,7 @@ from echo.storage.writer import (  # noqa: E402
     read_image_size,
     save_png,
 )
+from echo.hotkeys import parse_combo  # noqa: E402
 
 
 def make_image(w: int = 320, h: int = 320, seed: int = 0) -> np.ndarray:
@@ -172,6 +173,57 @@ class TestRegion(unittest.TestCase):
 
 # ======================================================================
 # 命名规则
+# ======================================================================
+class TestHotkeyParse(unittest.TestCase):
+    """热键组合解析：常用输入键禁止无修饰键单独注册。"""
+
+    def test_solo_letter_rejected(self):
+        """裸字母注册是全局的，会把系统里这个键全部截走，必须拒绝。"""
+        mods, vk, error = parse_combo("E")
+        self.assertEqual((mods, vk), (0, 0))
+        self.assertIn("无法打字", error)
+
+    def test_solo_digit_and_punct_rejected(self):
+        for combo in ("1", "SPACE", "`", "/"):
+            _, _, error = parse_combo(combo)
+            self.assertTrue(error, f"{combo!r} 应被拒绝")
+
+    def test_solo_fkey_and_numpad_allowed(self):
+        """F 区 / 小键盘不常用于打字，允许单键（默认 F9）。"""
+        for combo in ("F9", "NUMPAD1", "PRINTSCREEN", "PAUSE"):
+            mods, vk, error = parse_combo(combo)
+            self.assertEqual(error, "", f"{combo!r} 应允许：{error}")
+            self.assertNotEqual(vk, 0)
+
+    def test_letter_with_modifier_ok(self):
+        mods, vk, error = parse_combo("Ctrl+E")
+        self.assertEqual(error, "")
+        self.assertEqual(vk, ord("E"))
+        self.assertTrue(mods)
+
+
+class TestWgcBorderSupport(unittest.TestCase):
+    """旧版 Windows 10 没有 SetBorderRequired API，必须提前避开无边框模式。"""
+
+    def test_old_win10_not_supported(self):
+        from echo.capture.wgc_window import border_toggle_supported
+
+        for build in (19041, 19044, 19045):
+            self.assertFalse(border_toggle_supported(build), f"build={build}")
+
+    def test_win11_and_server_supported(self):
+        from echo.capture.wgc_window import border_toggle_supported
+
+        for build in (20348, 22000, 22631, 26100):
+            self.assertTrue(border_toggle_supported(build), f"build={build}")
+
+    def test_unknown_build_conservative(self):
+        """查询失败（build=0）按不支持处理，走带边框的保守路径。"""
+        from echo.capture.wgc_window import border_toggle_supported
+
+        self.assertFalse(border_toggle_supported(0))
+
+
 # ======================================================================
 class TestNaming(unittest.TestCase):
     def test_first_session_sequence(self):
