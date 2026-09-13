@@ -207,6 +207,18 @@ QLineEdit, QSpinBox, QPlainTextEdit, QTextEdit {{
     selection-background-color: {p.selection};
 }}
 QPlainTextEdit, QTextEdit {{ padding: 8px 10px; }}
+/* 诊断报告框：等宽字体 + 足够的高度。
+   ID 选择器专门盖掉上面那条 `QPlainTextEdit {{ height: 32px }}`——
+   不盖的话报告区会被压成一行输入框那么高。 */
+QPlainTextEdit#Report {{
+    font-family: {m.font_mono};
+    font-size: {m.size_tiny}px;
+    color: {p.text_dim};
+    background: {p.card_alt};
+    border: 1px solid {p.border_soft};
+    height: 264px;
+    padding: 10px 12px;
+}}
 QLineEdit:hover, QSpinBox:hover {{ border-color: {p.border}; }}
 QLineEdit:focus, QSpinBox:focus, QPlainTextEdit:focus, QTextEdit:focus {{
     border-color: {p.accent};

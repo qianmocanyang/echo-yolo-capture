@@ -13,7 +13,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..logging_setup import get_logger
-from .base import BackendCapability, CaptureBackend, CaptureError, SourceKind
+from .base import (
+    DEFAULT_DELIVERY_INTERVAL_MS,
+    BackendCapability,
+    CaptureBackend,
+    CaptureError,
+    SourceKind,
+)
 
 log = get_logger("capture.factory")
 
@@ -153,11 +159,24 @@ def resolve_backend(requested: str, kind: SourceKind) -> BackendResolution:
     )
 
 
-def create_backend(key: str, *, minimum_update_interval_ms: int = 16) -> CaptureBackend:
+def create_backend(
+    key: str, *, minimum_update_interval_ms: int = DEFAULT_DELIVERY_INTERVAL_MS
+) -> CaptureBackend:
+    """按 key 建后端。
+
+    ``minimum_update_interval_ms`` 是**交付节流**，别随手用默认值以外的数：
+
+    * DXGI 走 dxcam 的 ``target_fps``，不显式指定时是 60 —— 实测在 1080p 上
+      光是把画面复制出来就吃掉 97.8% 单核，而定时采集往往只要 1 张/秒；
+    * WGC 走 ``minimum_update_interval``，默认 16 ms 同样是 60 fps 的交付量。
+
+    调用方（pipeline）会按当前实际采集需求算出这个值。此处保留一个温和的
+    默认值，是为了即使有人漏传也不会把 CPU 吃满。
+    """
     if key == "dxgi":
         from .dxgi_monitor import DxgiMonitorBackend
 
-        return DxgiMonitorBackend()
+        return DxgiMonitorBackend(minimum_update_interval_ms=minimum_update_interval_ms)
     if key == "wgc":
         from .wgc_window import WgcBackend
 

@@ -99,6 +99,16 @@ class SourceSpec:
         return bool(self.identity) and self.identity == other.identity
 
 
+# 后端交付帧的默认节流（毫秒）。
+#
+# 采集侧几乎不需要 60 fps，而全速交付的代价极高：dxcam 不显式指定帧率时默认
+# target_fps=60，实测在 1080p 上空转就吃掉 97.8% 单核；压到 10 fps 只需 5%。
+# WGC 的 minimum_update_interval 默认 16 ms 同理。
+#
+# 定在 base 里是为了让 factory 与 pipeline 共用同一个默认值，避免两处漂移。
+DEFAULT_DELIVERY_INTERVAL_MS = 100
+
+
 @dataclass(frozen=True, slots=True)
 class BackendCapability:
     """后端的可用性与已知边界。不可用时必须给出原因，不能静默降级。"""

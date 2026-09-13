@@ -85,6 +85,15 @@ DXGI 是显示器专用的，切换会在界面上明说。
 捕获的是**客户区**，坐标全部换算到客户区原点，DPI 全程按物理像素处理。多显示器、
 125% / 150% 缩放都不会让选区偏移。
 
+**采集不影响游戏帧率**：后端按需交付帧（默认约 10 fps，连拍时自动放宽），
+不会以 60 fps 全速复制整屏——1080p 下这会把单个核心吃到 97%，压到 10 fps 后
+只需 5%。每帧做一次抽样亮度检查，连续 6 秒全黑（独占全屏 / HDR / 双显卡的
+典型表现）会自动暂停采集并给出针对性的排查提示，而不是默默存下一堆黑图。
+
+**抓不到画面？** 设置页底部有「采集诊断」：在本机把环境、后端能力、实际抓帧
+（含黑屏判定）完整跑一遍并给出结论，报告自动存到日志目录（`%APPDATA%\echo\logs\`），
+可以直接发给开发者。命令行等价物是 `python tools/diagnose_capture.py`。
+
 ---
 
 ## 三、保存目录结构
@@ -210,6 +219,8 @@ python tools/shot_exe.py out.png     # 指定输出路径
 | --- | --- |
 | 快捷键没反应 | 被别的程序占了。设置页会列出注册失败的项，换一个组合即可 |
 | 窗口采集一直「等待画面」 | WGC 只在窗口重绘时交付新帧。静态窗口不出帧是正常行为，不是卡死 |
+| 截图全是黑的 / 抓不到游戏内容 | 先跑设置页的「采集诊断」。全黑通常是：游戏独占全屏（改成无边框窗口）、开了 HDR（先关掉）、笔记本双显卡（游戏跑独显、采集核显输出，在「显示设置 → 图形」把游戏指定到同一块 GPU）。诊断报告会按你的机器给出具体结论 |
+| 采集时游戏掉帧、CPU 高 | 已内置后端节流（默认约 10 fps 交付），旧版本才有此问题；若仍偏高，检查是否同时开了多路采集 |
 | 全屏独占游戏截不到 | DXGI 在独占模式下会被阻断，改用窗口模式 + WGC |
 | 选区位置偏了 | 检查是否多显示器 + 非 100% 缩放；启动日志里 `dpi_awareness=False` 说明声明失败 |
 | 提示「保存位置不可用」 | 移动过保存目录，或盘符变了。重新选一次即可，数据库在目录里 |
@@ -230,6 +241,7 @@ echo/
 ├─ paths.py                  # 配置/日志/资源目录，is_frozen 分支
 ├─ winapi.py                 # ctypes 绑定的 Win32：DPI、显示器/窗口枚举、热键
 ├─ config.py / quality.py    # 配置持久化、感知哈希与质量标记
+├─ diagnose.py               # 采集链路诊断（界面按钮与 CLI 共用）
 ├─ hotkeys.py                # RegisterHotKey + WM_HOTKEY 事件过滤
 ├─ capture/                  # 采集后端：base / dxgi_monitor / wgc_window / factory
 ├─ storage/                  # naming / db / writer（原子写盘）/ manifest
@@ -241,7 +253,7 @@ docs/screenshot.png          # 界面截图
 echo.spec                    # PyInstaller 配置
 LICENSE                      # MIT
 .github/workflows/ci.yml     # CI：四道自检跑在 windows-latest
-tools/                       # selfcheck / check_attrs / smoke_* / make_icon / shot_exe
+tools/                       # selfcheck / check_attrs / smoke_* / bench_capture / diagnose_capture
 tests/test_logic.py          # 业务逻辑用例（49 个）
 ```
 

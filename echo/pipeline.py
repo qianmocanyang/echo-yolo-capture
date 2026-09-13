@@ -56,9 +56,10 @@ from .capture import (
     is_source_usable,
     resolve_backend,
 )
+from .capture.base import DEFAULT_DELIVERY_INTERVAL_MS
 from .config import AppConfig
 from .logging_setup import get_logger
-from .quality import QualityReport, find_similar, measure
+from .quality import BLANK_LUMA, QualityReport, find_similar, measure, quick_luma
 from .region import Region, center_region, validate_size
 from .storage import (
     Database,
@@ -92,6 +93,35 @@ QUEUE_MAX_ITEMS = 240
 
 SIMILAR_LOOKBACK = 200
 PREVIEW_MAX_SIDE = 640
+
+# ---- 全黑画面 --------------------------------------------------------------
+#
+# 这是实机上最容易被误解的一类故障：独占全屏、HDR 开启、笔记本双显卡这三种
+# 情况下，采集后端**不会报错**，API 一切正常，只是持续交付全黑帧。用户看到
+# 预览是黑的、存下来的是黑图，但状态栏一片正常，完全不知道该查什么。
+#
+# 所以这里做实时检测：黑帧不进入保存队列（它不可能是有效训练样本），持续全黑
+# 则暂停自动采集并给出针对性原因——宁可停下说清楚，也不要默默产出几千张黑图。
+BLANK_HOLD_SECONDS = 6.0         # 自动采集持续全黑超过这么久就暂停并提示
+
+BLANK_REASONS = (
+    "① 游戏是「独占全屏」——改成「无边框窗口」或「窗口化」；"
+    "② 游戏开了 HDR——先关掉 HDR 再试；"
+    "③ 笔记本双显卡时游戏跑在独显、而采集到的是核显输出。"
+)
+
+BLANK_HINT_MANUAL = "抓到的是全黑画面，不是游戏内容。" + BLANK_REASONS
+BLANK_HINT_AUTO = (
+    "持续抓到全黑画面，已暂停自动采集，避免产出一堆无效图片。" + BLANK_REASONS
+)
+BLANK_WAITING = "持续全黑画面"
+
+# 交付节流的上下界。默认值 DEFAULT_DELIVERY_INTERVAL_MS（100 ms ≈ 10 fps）
+# 就是上界——定时采集常常只要 1 张/秒，交付再稀疏也不会慢过需求。
+#
+# 为什么不按精确需求（比如 1 fps）节流：手动截图要等「下一帧」，节流太狠会让
+# F8 撞上 MANUAL_FRAME_TIMEOUT（0.7 s）。10 fps 是延迟与开销之间的平衡点。
+THROTTLE_FLOOR_MS = 16           # 最快 60 fps，再快没有意义
 
 
 class CaptureState(str, Enum):
@@ -699,6 +729,20 @@ class CapturePipeline(QObject):
             self._manual_pending = 0
         self._refresh_state()
 
+    def pause_auto_on_blank(self) -> None:
+        """采集线程检测到持续全黑时调用。
+
+        与 :meth:`pause_auto` 的差别只在语义：两者都进 PAUSED、都不自动恢复。
+        之所以选择停下来而不是继续跑，是因为继续下去只会得到一堆全黑图片——
+        那种「看起来在正常工作」的假象，比直接停下来更难排查。用户在界面上
+        重新点「开始采集」即可恢复。
+        """
+        self._mode = RunMode.PAUSED
+        self._waiting_reason = BLANK_WAITING
+        with self._lock:
+            self._manual_pending = 0
+        self._refresh_state()
+
     def toggle_auto(self) -> tuple[bool, str]:
         if self._mode is RunMode.AUTO:
             self.pause_auto()
@@ -1144,6 +1188,9 @@ class _CaptureWorker:
         self._next_source_check = 0.0
         self._next_reconnect = 0.0
         self._manual_deadline = 0.0
+        # 全黑画面检测：本次「黑屏事件」的起点，以及是否已经提示过
+        self._blank_since = 0.0
+        self._blank_hinted = False
         self._burst_until = 0.0
 
     # ---- 命令 -----------------------------------------------------------
@@ -1172,7 +1219,10 @@ class _CaptureWorker:
         self.backend_key = command.backend_key
         self.region = command.region
         try:
-            backend = create_backend(command.backend_key)
+            backend = create_backend(
+                command.backend_key,
+                minimum_update_interval_ms=self._deliver_interval_ms(),
+            )
             backend.open(command.source)
         except CaptureError as exc:
             log.warning("启动采集后端失败：%s", exc)
@@ -1247,13 +1297,19 @@ class _CaptureWorker:
             if not self._check_source_change():
                 return
 
-        self.p._set_waiting("")
+        # 全黑闸门放在预览之前判：预览照发（黑屏本身就是最直观的反馈），
+        # 但黑帧不进保存队列。
+        allow_save = self._blank_gate(frame, now, manual=manual_pending > 0)
+        self.p._set_waiting("" if allow_save else BLANK_WAITING)
         self._manual_deadline = 0.0
 
         if self.preview_enabled and (now >= self._next_preview_at or self.preview_dirty):
             self._next_preview_at = now + 1.0 / PREVIEW_FPS
             self.preview_dirty = False
             self._emit_preview(frame)
+
+        if not allow_save:
+            return
 
         if manual_pending > 0 and self._take_manual():
             self._enqueue(frame, TriggerKind.MANUAL, bypass_dedup=True)
@@ -1288,7 +1344,10 @@ class _CaptureWorker:
             return
 
         try:
-            backend = create_backend(self.backend_key or self.p._backend_key)
+            backend = create_backend(
+                self.backend_key or self.p._backend_key,
+                minimum_update_interval_ms=self._deliver_interval_ms(),
+            )
             backend.open(self.source)
         except CaptureError as exc:
             self.p._set_waiting(f"等待画面：{exc}")
@@ -1314,6 +1373,22 @@ class _CaptureWorker:
         if self.preview_enabled:
             return float(PREVIEW_FPS)
         return 0.0
+
+    def _deliver_interval_ms(self) -> int:
+        """后端交付帧的最小间隔（毫秒）。
+
+        这是**后端侧**的节流，与 :meth:`_desired_fps`（本进程的取帧节奏）不是
+        一回事：后端不节流的话，即使我们每秒只取一张，它也会以 60 fps 持续把
+        整屏复制出来——那才是采集期间 CPU 被吃满的原因。
+
+        只有连拍要求高于默认帧率时才需要比默认值更密；预览与定时采集的需求
+        都落在默认值之内。
+        """
+        interval = DEFAULT_DELIVERY_INTERVAL_MS
+        fps = int(self.burst_fps or 0)
+        if fps > 1:
+            interval = min(interval, int(1000 / fps))
+        return max(THROTTLE_FLOOR_MS, interval)
 
     def _manual_pending(self) -> int:
         with self.p._lock:
@@ -1370,6 +1445,41 @@ class _CaptureWorker:
         else:
             self._manual_deadline = 0.0
             self.p._set_waiting("等待画面更新")
+
+    def _blank_gate(self, frame, now: float, *, manual: bool) -> bool:
+        """全黑画面闸门。返回 True 表示这一帧可以进入保存流程。
+
+        判据用很低的阈值配很轻的采样（``quick_luma``，约 0.02 ms），只抓「真·全黑」，
+        不误伤夜战、洞穴、黑屏过场这类正常的暗场景。
+
+        为什么需要它：独占全屏 / HDR / 双显卡这三种情况下，采集后端**不会报错**，
+        只是持续交付全黑帧。少了这道闸门，用户会拿到几千张黑图，而状态栏一切正常，
+        完全不知道该查什么。
+        """
+        luma = quick_luma(frame.image)
+        if luma < 0 or luma >= BLANK_LUMA:
+            self._blank_since = 0.0
+            self._blank_hinted = False
+            return True
+
+        if self._blank_since <= 0.0:
+            self._blank_since = now
+        held = now - self._blank_since
+
+        if not self._blank_hinted:
+            if manual:
+                # 手动按下就是明确要这一张，照存，但必须立刻告诉他这是黑的
+                self._blank_hinted = True
+                self.p.notice.emit("warn", BLANK_HINT_MANUAL)
+            elif held >= BLANK_HOLD_SECONDS:
+                self._blank_hinted = True
+                log.warning("持续全黑画面 %.1f 秒，暂停自动采集", held)
+                self.p.notice.emit("error", BLANK_HINT_AUTO)
+                self.p.pause_auto_on_blank()
+
+        # 手动要的照存；自动采集的黑帧直接丢——它不可能是有效训练样本，
+        # 存下来只会污染数据集、堆满磁盘
+        return manual
 
     def _handle_capture_error(self, exc: CaptureError) -> None:
         log.warning("采集出错：%s", exc)
