@@ -177,6 +177,10 @@ class CapturePage(QWidget):
         self.source_combo = QComboBox()
         self.source_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.source_combo.currentIndexChanged.connect(self._on_source_selected)
+        # activated 在用户每次从下拉列表点选时都会触发（哪怕选的还是当前项），
+        # 补它是因为：下拉框加载时「显示器 1」默认就停在第 0 项，用户再点
+        # 同一项不会发 currentIndexChanged，select_source 就永远没机会执行。
+        self.source_combo.activated.connect(self._on_source_selected)
         card.add(self.source_combo)
 
         self.source_note = hint("", card)
@@ -435,6 +439,12 @@ class CapturePage(QWidget):
             self.source_combo.setEnabled(False)
         else:
             self.source_combo.setEnabled(True)
+            # 源还没真正选中时先放一个占位项：不然下拉框默认停在第一条上，
+            # 看起来「已选中」，实际 select_source 从未执行，开始按钮一直
+            # 灰着，用户却以为自己选好了。
+            placeholder = self.app.pipeline.source is None
+            if placeholder:
+                self.source_combo.addItem("— 请选择要采集的源 —", None)
             for entry in entries:
                 text = entry.label
                 if entry.spec.kind is SourceKind.MONITOR:
@@ -444,13 +454,21 @@ class CapturePage(QWidget):
             identity = self.app.config.capture.source_identity
             current = self.app.pipeline.source
             target_index = 0
+            matched = False
             for index, entry in enumerate(entries):
                 if current is not None and entry.spec.source_id == current.source_id:
                     target_index = index
+                    matched = True
                     break
                 if identity and entry.spec.identity == identity:
                     target_index = index
-            self.source_combo.setCurrentIndex(target_index)
+                    matched = True
+            if placeholder:
+                # 匹配到才落到真实条目上；没匹配到就停在占位项（下标 0）
+                combo_index = target_index + 1 if matched else 0
+            else:
+                combo_index = target_index
+            self.source_combo.setCurrentIndex(combo_index)
         self.source_combo.blockSignals(False)
 
         if entries and self.app.pipeline.source is None:
@@ -626,7 +644,17 @@ class CapturePage(QWidget):
         entry = self.source_combo.itemData(index)
         if entry is None:
             return
-        self.app.select_source(entry.spec)
+        current = self.app.pipeline.source
+        if (
+            current is not None
+            and current.source_id == entry.spec.source_id
+            and self.app.pipeline.backend_key == self.app.config.capture.backend
+        ):
+            return  # 已经是这个源（两个信号都触发时会走到这里），不重开
+        ok, _ = self.app.select_source(entry.spec)
+        if not ok:
+            # 选失败了就让下拉框回到真实状态，别假装已选中
+            self._reload_sources()
         self.refresh_all()
 
     def _on_switch_backend(self) -> None:
