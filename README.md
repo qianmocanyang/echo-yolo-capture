@@ -282,9 +282,15 @@ tests/test_logic.py          # 业务逻辑用例（49 个）
 
 ## 九、路线图 / 还没做的
 
+详细的优化清单与优先级见 [`docs/roadmap.md`](docs/roadmap.md)，这里只列方向：
+
 - **内置标注编辑器**：当前流程是从外部标注工具导入（`dataset/importer.py` 已支持
   Ultralytics 与 CVAT 两种格式）。内置编辑器的扩展点留在图库页的单元格双击事件上。
-- **模型预标注**：`pipeline` 的队列结构已支持插入外部产出的标注框，但未接模型。
+- **模型预标注与推理**：`pipeline` 的队列结构已支持插入外部产出的标注框，但未接模型。
+  技术选型见 [`docs/auto-label-research.md`](docs/auto-label-research.md)。
+- **训练集成**：训练脚本进不了这个包（AGPL-3.0 许可 + 打包版没有 Python 解释器 +
+  需要独立显卡），形态是「echo 做环境编排 + 训练在独立进程跑」，设计见
+  [`docs/roadmap.md`](docs/roadmap.md) 第二部分。
 - **实机验收**：只在真实游戏里跑过一轮基础流程，多种引擎（Unity / Unreal / 全屏独占）
   下的表现还没系统验证过。
 
