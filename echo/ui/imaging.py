@@ -51,41 +51,56 @@ def to_pixmap(image: np.ndarray) -> QPixmap:
     return QPixmap.fromImage(qimage) if not qimage.isNull() else QPixmap()
 
 
-@lru_cache(maxsize=512)
-def _cached_thumb(path_str: str, target: int, mtime: float) -> QPixmap:
-    """按 (路径, 目标尺寸, 修改时间) 缓存缩略图。
+@lru_cache(maxsize=768)
+def _cached_thumb_image(path_str: str, target: int, mtime: float) -> QImage:
+    """按 (路径, 目标尺寸, 修改时间) 缓存**缩放后的 QImage**。
+
+    缓存 QImage 而不是 QPixmap 是有意的：QPixmap 只能在 GUI 线程使用，
+    而 QImage 可以在工作线程里创建——图片库翻页要靠后台预解码把
+    上百张图的主线程阻塞省掉，缓存层必须先能跨线程。
 
     带 mtime 是为了让"重新标注/覆盖图片"后缓存自动失效，
     否则界面会一直显示旧图，是最难发现的一类 bug。
     """
     path = Path(path_str)
     if not path.exists():
-        return QPixmap()
+        return QImage()
 
     image = QImage()
     if not image.loadFromData(path.read_bytes()):
-        return QPixmap()
+        return QImage()
 
-    scaled = image.scaled(
+    return image.scaled(
         QSize(target, target),
         Qt.KeepAspectRatio,
         Qt.SmoothTransformation,
     )
-    return QPixmap.fromImage(scaled)
 
 
-def thumbnail(path: Path, target: int = 128) -> QPixmap:
-    """读取缩略图。文件缺失或损坏时返回空 QPixmap，由界面画占位。"""
+def thumbnail_image(path: Path, target: int = 128) -> QImage:
+    """读取缩略图（QImage）。**可以在工作线程里安全调用**。
+
+    文件缺失或损坏时返回空 QImage，由界面画占位。
+    """
     try:
         stat = path.stat()
     except OSError:
-        return QPixmap()
-    pixmap = _cached_thumb(str(path), target, stat.st_mtime)
-    return pixmap
+        return QImage()
+    return _cached_thumb_image(str(path), target, stat.st_mtime)
+
+
+def thumbnail(path: Path, target: int = 128) -> QPixmap:
+    """读取缩略图（QPixmap）。只能在 GUI 线程调用。
+
+    走的是同一份 QImage 缓存，所以界面线程热路径上几乎不需要解码，
+    只剩一次 QPixmap.fromImage 的拷贝（140×140 约 0.02ms）。
+    """
+    image = thumbnail_image(path, target)
+    return QPixmap.fromImage(image) if not image.isNull() else QPixmap()
 
 
 def clear_thumbnail_cache() -> None:
-    _cached_thumb.cache_clear()
+    _cached_thumb_image.cache_clear()
 
 
 def placeholder(target: int, color: str) -> QPixmap:

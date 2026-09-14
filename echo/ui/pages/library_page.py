@@ -17,13 +17,24 @@ import json
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSize, Qt, QThread, Signal
+from PySide6.QtCore import (
+    QObject,
+    QRunnable,
+    QSize,
+    Qt,
+    QThread,
+    QThreadPool,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -33,6 +44,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -69,6 +81,10 @@ log = get_logger("ui.library")
 
 PAGE_SIZE = 96
 GRID_CELL = 148
+# 缩略图长边像素。比格子小 8px，给边框留一圈内边距。
+THUMB_TARGET = GRID_CELL - 8
+# 分帧建格子时每帧建几个。12 个约 5ms，看不出停顿；一次建满 96 个要 40ms 以上。
+CELLS_PER_TICK = 12
 
 
 class _GridCell(QWidget):
@@ -93,12 +109,9 @@ class _GridCell(QWidget):
         self._image = QLabel(self)
         self._image.setAlignment(Qt.AlignCenter)
         self._image.setFixedHeight(GRID_CELL)
-        pixmap = imaging.thumbnail(abs_path, GRID_CELL - 8)
-        if pixmap.isNull():
-            self._image.setText("无法预览")
-            self._image.setObjectName("Hint")
-        else:
-            self._image.setPixmap(pixmap)
+        # 这里**不**同步解码图片：一页 96 张冷缓存要 239ms（实测），
+        # 整页就是一顿。改成先留白，由页面统一交给后台线程解码，
+        # 解完再 set_thumbnail 回填。
         box.addWidget(self._image)
 
         footer = QHBoxLayout()
@@ -113,6 +126,24 @@ class _GridCell(QWidget):
 
         self.setToolTip(self._tooltip())
         self._refresh_status()
+
+    def set_thumbnail(self, pixmap: QPixmap | None) -> None:
+        """后台解码完成后回填缩略图。只能在 GUI 线程调用。
+
+        QPixmap 必须在 GUI 线程构造，所以后台线程只送回 QImage，
+        由这里转成 QPixmap 再挂上去。
+        """
+        if pixmap is None or pixmap.isNull():
+            self._image.clear()
+            self._image.setText("无法预览")
+            if self._image.objectName() != "Hint":
+                # 换了 objectName 要重新 polish 才会套上对应样式
+                self._image.setObjectName("Hint")
+                self._image.style().unpolish(self._image)
+                self._image.style().polish(self._image)
+            return
+        self._image.setText("")
+        self._image.setPixmap(pixmap)
 
     def _tooltip(self) -> str:
         row = self.row
@@ -161,6 +192,47 @@ class _GridCell(QWidget):
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802
         self.menu_requested.emit(self.row, event.globalPos())
+
+
+class _ThumbSink(QObject):
+    """缩略图后台解码的回传通道。
+
+    单独做成 QObject 是为了给信号一个明确的生命周期：连接挂在它身上，
+    页面销毁时 Qt 会自动断开，不会出现"回调打到已析构对象上"。
+    """
+
+    ready = Signal(int, int, object)     # token, 单元格下标, QImage
+
+
+class _ThumbTask(QRunnable):
+    """在工作线程里把一张图解码成缩放后的 QImage。
+
+    只碰 QImage，不碰 QPixmap——QPixmap 只能在 GUI 线程构造。
+    """
+
+    def __init__(
+        self,
+        token: int,
+        index: int,
+        path: Path,
+        target: int,
+        sink: _ThumbSink,
+    ):
+        super().__init__()
+        self._token = token
+        self._index = index
+        self._path = path
+        self._target = target
+        self._sink = sink
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        try:
+            image = imaging.thumbnail_image(self._path, self._target)
+        except Exception as exc:  # 后台线程里绝不能把异常抛出去
+            log.debug("缩略图解码失败 %s：%s", self._path, exc)
+            image = QImage()
+        self._sink.ready.emit(self._token, self._index, image)
 
 
 class _Worker(QObject):
@@ -212,6 +284,22 @@ class LibraryPage(QWidget):
         self._selected: set[int] = set()
         self._page = 0
         self._thread: QThread | None = None
+        # 网格重排用：这一页的数据、上一次实际排出来的列数。
+        # 列数变化时（窗口拉伸、页面首次显示）要能按新列数重排。
+        self._current_rows: list = []
+        self._rendered_columns = 0
+
+        # 缩略图后台解码：一页 96 张冷缓存同步解码要 239ms（实测），
+        # 交给线程池之后主线程只做 QPixmap 转换。
+        self._thumb_sink = _ThumbSink(self)
+        self._thumb_sink.ready.connect(self._on_thumb_ready)
+        self._thumb_pool = QThreadPool(self)
+        self._thumb_pool.setMaxThreadCount(max(2, min(4, (os.cpu_count() or 2))))
+        # 每次重排递增，用来丢弃"翻页后才回来的"过期解码结果
+        self._render_token = 0
+        # 分帧建格子：还没建出来的 (下标, 数据行)；_render_layout 是这批用的目录
+        self._pending_cells: list = []
+        self._render_layout = None
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(20, 16, 20, 16)
@@ -273,11 +361,24 @@ class LibraryPage(QWidget):
         search_row.addWidget(self._button("显示相似项", lambda: self._quick_filter("similar")))
         box.addLayout(search_row)
 
-        self.grid_holder = QWidget(holder)
+        # 网格必须放在滚动区里。直接塞进竖直布局的话，容器高度就是布局
+        # 给的那点剩余空间（实测 416px），而 96 张图排完要一千多像素——
+        # QGridLayout 在空间不够时会**把行高强压下去**（每行只剩 ~52px），
+        # 缩略图就被挤成一条条横带，看起来"融成一坨"。
+        # 右侧栏早就用了 ScrollColumn，左边这块当时漏了。
+        self.grid_holder = QWidget()
         self.grid = QGridLayout(self.grid_holder)
         self.grid.setContentsMargins(0, 0, 0, 0)
         self.grid.setSpacing(10)
-        box.addWidget(self.grid_holder, 1)
+
+        self.grid_scroll = QScrollArea(holder)
+        self.grid_scroll.setWidgetResizable(True)
+        self.grid_scroll.setFrameShape(QFrame.NoFrame)
+        # 列数是按容器宽度算的，横向不该出现滚动条
+        self.grid_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.grid_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.grid_scroll.setWidget(self.grid_holder)
+        box.addWidget(self.grid_scroll, 1)
 
         self.empty_hint = QLabel("", holder)
         self.empty_hint.setObjectName("Hint")
@@ -537,9 +638,41 @@ class LibraryPage(QWidget):
     # ==================================================================
     # 网格渲染
     # ==================================================================
+    def _grid_columns(self) -> int | None:
+        """按网格容器的真实宽度算能放几列；宽度还没定下来时返回 None。
+
+        两个都不能省的细节：
+
+        1. 不能拿 ``self.width()`` 当可用宽度。页面左右有边距、右边还有整块
+           侧栏，网格容器比页面窄得多（实测页面 984 时容器只有 584）。用页面
+           宽度算会把列数算多，控件挤不下就是一片错位。
+        2. 容器宽度本身要等页面真正显示过才是最终值。构造阶段它是默认的
+           100px，这时算出来的列数没有意义，宁可先不排。
+        """
+        width = self.grid_holder.width()
+        spacing = self.grid.spacing()
+        if width < GRID_CELL + spacing:
+            return None
+        columns = (width + spacing) // (GRID_CELL + spacing)
+        return max(2, min(8, int(columns)))
+
     def _render(self, rows) -> None:
+        self._current_rows = list(rows)
+        # 先让上一轮的回包全部作废：翻页很快时，旧页的解码结果不能落到新页的格子上
+        self._render_token += 1
+        token = self._render_token
+        self._thumb_pool.clear()          # 丢掉还没开始跑的任务
+        self._pending_cells = []
+
+        # 旧控件必须先 setParent(None) 再 deleteLater()。
+        # deleteLater() 是**异步**的，removeWidget() 又只解除布局管辖、
+        # 控件本身仍然可见——只做这两步的话，旧网格会一直留在屏幕上，
+        # 新网格叠上去就成了"融成一坨"。首次打开时旧网格是按错误的容器
+        # 宽度排的，错位最明显；第二次打开时新旧尺寸接近，看不太出来，
+        # 于是表现为"再打开一次就好了"。
         for cell in self._cells:
             self.grid.removeWidget(cell)
+            cell.setParent(None)
             cell.deleteLater()
         self._cells.clear()
         self._selected.clear()
@@ -549,6 +682,7 @@ class LibraryPage(QWidget):
             item = self.grid.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                widget.setParent(None)
                 widget.deleteLater()
 
         layout = self.app.layout()
@@ -556,22 +690,103 @@ class LibraryPage(QWidget):
             self.empty_hint.setText(
                 "这里还没有图片。回到「采集」页选好源、设好保存位置，按 F8 就能截第一张。"
             )
+            self._rendered_columns = 0
             return
         self.empty_hint.setText("")
 
-        columns = max(2, self.width() // (GRID_CELL + 14) - 2)
-        columns = min(columns, 8)
-        for index, row in enumerate(rows):
-            cell = _GridCell(row, layout.absolute(row["rel_path"]), self.grid_holder)
+        columns = self._grid_columns()
+        if columns is None:
+            # 容器宽度还没定下来：先记住这批数据，等 showEvent/resizeEvent 再排。
+            self._rendered_columns = 0
+            return
+        self._rendered_columns = columns
+        self._render_layout = layout
+
+        # 上一次渲染可能留下更多列的 stretch，先清掉，免得影响新的列宽分配
+        for column in range(self.grid.columnCount()):
+            self.grid.setColumnStretch(column, 0)
+        for row_index in range(self.grid.rowCount()):
+            self.grid.setRowStretch(row_index, 0)
+
+        # 分帧建格子：96 个 _GridCell 一次性建要 40ms 以上（实测，还没算
+        # Qt 的布局），翻页就会顿一下。拆成每帧一小批，界面始终能响应。
+        self._pending_cells = list(enumerate(rows))
+        self._create_cells_step(token)
+
+    def _create_cells_step(self, token: int) -> None:
+        """建一批格子，没建完就交给事件循环，下一轮继续。"""
+        if token != self._render_token:
+            return                        # 期间已经翻页/重排，这批作废
+        layout = self._render_layout
+        columns = self._rendered_columns
+        if layout is None or columns <= 0:
+            self._pending_cells = []
+            return
+
+        budget = CELLS_PER_TICK
+        while self._pending_cells and budget > 0:
+            index, row = self._pending_cells.pop(0)
+            abs_path = layout.absolute(row["rel_path"])
+            cell = _GridCell(row, abs_path, self.grid_holder)
             cell.toggled.connect(self._on_cell_toggled)
             cell.opened.connect(lambda r: self.app.reveal_file(str(layout.absolute(r["rel_path"]))))
             cell.menu_requested.connect(self._on_cell_menu)
             self.grid.addWidget(cell, index // columns, index % columns)
             self._cells.append(cell)
+            # 解码丢给线程池，先显示空白格子；解完由 _on_thumb_ready 回填
+            self._thumb_pool.start(
+                _ThumbTask(token, index, abs_path, THUMB_TARGET, self._thumb_sink)
+            )
+            budget -= 1
+
+        if self._pending_cells:
+            QTimer.singleShot(0, lambda: self._create_cells_step(token))
+            return
 
         for column in range(columns):
             self.grid.setColumnStretch(column, 1)
         self.grid.setRowStretch(self.grid.rowCount(), 1)
+
+    def _flush_pending_cells(self) -> None:
+        """把还没建的格子一次建完。
+
+        需要遍历完整网格的操作（当前只有"全选本页"）先调它，
+        否则会漏掉还没建出来的那部分。
+        """
+        while self._pending_cells:
+            self._create_cells_step(self._render_token)
+
+    def _relayout_if_needed(self) -> None:
+        """容器宽度变化后按新列数重排。只重排，不重新查库。"""
+        if not self._current_rows:
+            return
+        columns = self._grid_columns()
+        if columns is None or columns == self._rendered_columns:
+            return
+        self._render(self._current_rows)
+
+    def _on_thumb_ready(self, token: int, index: int, image) -> None:
+        """后台解码完成，把缩略图回填到对应格子。"""
+        if token != self._render_token:
+            return                      # 期间已翻页/重排，这批结果作废
+        if not 0 <= index < len(self._cells):
+            return
+        if image is None or image.isNull():
+            self._cells[index].set_thumbnail(None)
+            return
+        self._cells[index].set_thumbnail(QPixmap.fromImage(image))
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        # 页面第一次显示后才拿到真实尺寸；构造阶段那次渲染的列数不作数，
+        # 这里延后一拍重排（此刻布局可能还没派发完）。
+        QTimer.singleShot(0, self._relayout_if_needed)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # 窗口变宽/变窄会改变能放下的列数；同步重排会在布局更新前读到旧宽度，
+        # 所以同样延后一拍。
+        QTimer.singleShot(0, self._relayout_if_needed)
 
     def _on_cell_toggled(self, image_id: int, checked: bool) -> None:
         if checked:
@@ -587,6 +802,8 @@ class LibraryPage(QWidget):
         )
 
     def _select_all(self, value: bool) -> None:
+        # 格子是分帧建的，先补完再全选，否则会漏掉还没建出来的那些
+        self._flush_pending_cells()
         for cell in self._cells:
             cell.set_checked(value)
 
@@ -595,8 +812,6 @@ class LibraryPage(QWidget):
         self.refresh()
 
     def _schedule_refresh(self) -> None:
-        from PySide6.QtCore import QTimer
-
         if self._refresh_timer is None:
             self._refresh_timer = QTimer(self)
             self._refresh_timer.setSingleShot(True)
