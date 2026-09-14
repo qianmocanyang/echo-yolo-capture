@@ -217,6 +217,7 @@ class _ThumbTask(QRunnable):
         path: Path,
         target: int,
         sink: _ThumbSink,
+        dpr: float = 1.0,
     ):
         super().__init__()
         self._token = token
@@ -224,11 +225,13 @@ class _ThumbTask(QRunnable):
         self._path = path
         self._target = target
         self._sink = sink
+        # 缩放比由主线程取好传进来——QScreen 不能在后台线程碰
+        self._dpr = dpr
         self.setAutoDelete(True)
 
     def run(self) -> None:
         try:
-            image = imaging.thumbnail_image(self._path, self._target)
+            image = imaging.thumbnail_image(self._path, self._target, self._dpr)
         except Exception as exc:  # 后台线程里绝不能把异常抛出去
             log.debug("缩略图解码失败 %s：%s", self._path, exc)
             image = QImage()
@@ -300,6 +303,9 @@ class LibraryPage(QWidget):
         # 分帧建格子：还没建出来的 (下标, 数据行)；_render_layout 是这批用的目录
         self._pending_cells: list = []
         self._render_layout = None
+        # 主屏缩放比（在 _render 里按真实屏幕覆盖）。125% 缩放下必须按物理
+        # 像素解码缩略图，否则会被系统放大画出来、发虚。
+        self._thumb_dpr = 1.0
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(20, 16, 20, 16)
@@ -701,6 +707,9 @@ class LibraryPage(QWidget):
             return
         self._rendered_columns = columns
         self._render_layout = layout
+        # 主屏缩放比：125% 缩放下按逻辑尺寸解码出来的图会被系统放大画，
+        # 缩略图会发虚，所以按物理像素解码。这里在主线程取一次给后台用。
+        self._thumb_dpr = imaging.screen_dpr()
 
         # 上一次渲染可能留下更多列的 stretch，先清掉，免得影响新的列宽分配
         for column in range(self.grid.columnCount()):
@@ -735,7 +744,10 @@ class LibraryPage(QWidget):
             self._cells.append(cell)
             # 解码丢给线程池，先显示空白格子；解完由 _on_thumb_ready 回填
             self._thumb_pool.start(
-                _ThumbTask(token, index, abs_path, THUMB_TARGET, self._thumb_sink)
+                _ThumbTask(
+                    token, index, abs_path, THUMB_TARGET,
+                    self._thumb_sink, self._thumb_dpr,
+                )
             )
             budget -= 1
 

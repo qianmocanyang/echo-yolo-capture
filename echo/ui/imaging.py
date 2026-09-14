@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QGuiApplication, QImage, QPixmap
 
 from ..logging_setup import get_logger
 
@@ -52,8 +52,8 @@ def to_pixmap(image: np.ndarray) -> QPixmap:
 
 
 @lru_cache(maxsize=768)
-def _cached_thumb_image(path_str: str, target: int, mtime: float) -> QImage:
-    """按 (路径, 目标尺寸, 修改时间) 缓存**缩放后的 QImage**。
+def _cached_thumb_image(path_str: str, target: int, mtime: float, dpr: float) -> QImage:
+    """按 (路径, 目标尺寸, 修改时间, 缩放比) 缓存**缩放后的 QImage**。
 
     缓存 QImage 而不是 QPixmap 是有意的：QPixmap 只能在 GUI 线程使用，
     而 QImage 可以在工作线程里创建——图片库翻页要靠后台预解码把
@@ -70,32 +70,57 @@ def _cached_thumb_image(path_str: str, target: int, mtime: float) -> QImage:
     if not image.loadFromData(path.read_bytes()):
         return QImage()
 
-    return image.scaled(
-        QSize(target, target),
+    # target 是**逻辑**尺寸。125% 缩放的屏幕上，按逻辑尺寸解码出来的图
+    # 会被系统放大 1.25 倍画出来，细节直接糊掉——所以按物理像素解码
+    # （140 → 175），再把 DPR 写回图像，Qt 就会按逻辑尺寸摆放。
+    size = max(1, int(round(target * dpr)))
+    scaled = image.scaled(
+        QSize(size, size),
         Qt.KeepAspectRatio,
         Qt.SmoothTransformation,
     )
+    if dpr != 1.0:
+        scaled.setDevicePixelRatio(dpr)
+    return scaled
 
 
-def thumbnail_image(path: Path, target: int = 128) -> QImage:
+def screen_dpr() -> float:
+    """主屏缩放比（125% 缩放 → 1.25）。
+
+    QScreen 不是线程安全的，所以只允许在 GUI 线程调用；
+    后台线程要用的值由调用方在主线程先算好再传进去。
+    """
+    app = QGuiApplication.instance()
+    if app is None:
+        return 1.0
+    screen = app.primaryScreen()
+    if screen is None:
+        return 1.0
+    return max(1.0, float(screen.devicePixelRatio()))
+
+
+def thumbnail_image(path: Path, target: int = 128, dpr: float = 1.0) -> QImage:
     """读取缩略图（QImage）。**可以在工作线程里安全调用**。
 
-    文件缺失或损坏时返回空 QImage，由界面画占位。
+    dpr 由调用方从 GUI 线程取好传进来（见 :func:`screen_dpr`），
+    这里不自己去查屏幕。文件缺失或损坏时返回空 QImage，由界面画占位。
     """
     try:
         stat = path.stat()
     except OSError:
         return QImage()
-    return _cached_thumb_image(str(path), target, stat.st_mtime)
+    return _cached_thumb_image(str(path), target, stat.st_mtime, max(1.0, float(dpr)))
 
 
-def thumbnail(path: Path, target: int = 128) -> QPixmap:
+def thumbnail(path: Path, target: int = 128, dpr: float = 0.0) -> QPixmap:
     """读取缩略图（QPixmap）。只能在 GUI 线程调用。
 
-    走的是同一份 QImage 缓存，所以界面线程热路径上几乎不需要解码，
-    只剩一次 QPixmap.fromImage 的拷贝（140×140 约 0.02ms）。
+    ``dpr=0`` 表示自动按当前主屏缩放比解码（推荐）；显式传值用于
+    已知目标屏幕的场合。走的是同一份 QImage 缓存，界面线程热路径上
+    几乎不需要解码，只剩一次 QPixmap.fromImage 的拷贝。
     """
-    image = thumbnail_image(path, target)
+    scale = dpr if dpr > 0 else screen_dpr()
+    image = thumbnail_image(path, target, scale)
     return QPixmap.fromImage(image) if not image.isNull() else QPixmap()
 
 
