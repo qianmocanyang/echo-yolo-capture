@@ -56,6 +56,70 @@ def hint(text: str, parent: QWidget | None = None) -> QLabel:
     return label
 
 
+class ElidedLabel(QLabel):
+    """长文本标签：放不下就在中间省略，并且**不把父容器撑宽**。
+
+    存在的理由是 Windows 路径这类**没有空格的长串**。QLabel 即使开了
+    ``setWordWrap(True)`` 也断不开它——整条路径是一个不可断词，
+    ``minimumSizeHint()`` 仍然是整串的宽度（实测 540px）。放进固定宽度
+    的右栏里，一条路径就能把整列的最小宽度顶到 590，而
+    :class:`ScrollColumn` 关掉了水平滚动条，于是右栏右侧一大片控件被
+    **静默裁掉**（存储卡要求 582px、视口只有 334px，精确坐标按钮、
+    X/Y 输入框、锁定宽高比按钮全都看不见）。
+
+    省略是中间省略：路径的头（盘符/用户目录）和尾（批次目录）都有用，
+    中间那段最没信息量。完整值仍可从 ``fullText()`` 或 tooltip 拿到。
+    """
+
+    def __init__(
+        self,
+        text: str = "",
+        parent: QWidget | None = None,
+        *,
+        mode: Qt.TextElideMode = Qt.ElideMiddle,
+    ):
+        super().__init__(parent)
+        self._full = ""
+        self._mode = mode
+        # 水平方向声明为 Ignored：布局不再参考它的 sizeHint，
+        # 它拿到多少宽度就画多少，宽度归零也不会撑破父容器。
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        self._full = text or ""
+        self.setToolTip(self._full)
+        self._apply_elide()
+
+    def fullText(self) -> str:  # noqa: N802
+        """未被省略的完整文本（用于复制/日志）。"""
+        return self._full
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        # 宽度给 0：让父布局按其他控件决定卡片宽度，自己不参与竞争。
+        return QSize(0, super().sizeHint().height())
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return QSize(0, super().minimumSizeHint().height())
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self) -> None:
+        width = self.width()
+        plain = QLabel.text(self)
+        if width <= 0 or not self._full:
+            if plain != self._full:
+                QLabel.setText(self, self._full)
+            return
+        elided = self.fontMetrics().elidedText(self._full, self._mode, width)
+        # 只在结果真的变了才写回：否则 setText → 重排 → resizeEvent
+        # → setText 会形成回环。
+        if elided != plain:
+            QLabel.setText(self, elided)
+
+
 def title(text: str, parent: QWidget | None = None) -> QLabel:
     label = QLabel(text, parent)
     label.setObjectName("CardTitle")

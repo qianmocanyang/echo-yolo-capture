@@ -66,7 +66,19 @@ class Metrics:
     card_padding_wide: int = 24
     sidebar_width: int = 196
     sidebar_width_compact: int = 68
-    settings_width: int = 344
+    # 这个值必须容得下右侧栏**最宽一张卡片的最小宽度**，否则卡片会被顶出
+    # 视口，而 ScrollColumn 关着水平滚动条，超出部分直接看不见（实测过：
+    # 存储卡的路径标签要 540px，把整列顶到 590px，视口只有 334px，
+    # 「精确坐标」按钮和 X/Y 输入框整片消失）。
+    #
+    # 目前的账（tools/check_layout.py 会守住）：
+    #   采集页最宽卡（热键）  内容 362
+    #   图片库最宽卡（导出）  内容 376   ← 决定值
+    #   + 右边距 8 + 纵向滚动条 10 → 需要 394，取 400 留 6px 余量。
+    #
+    # 逻辑像素与屏幕缩放无关（Qt 会把 pt 字号折算成固定逻辑尺寸），所以这个
+    # 值在 125%/150% 缩放下都成立；只有换字体族才需要重新核对。
+    settings_width: int = 400
     topbar_height: int = 56
     statusbar_height: int = 32
     thumb_height: int = 104

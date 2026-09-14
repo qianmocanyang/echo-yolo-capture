@@ -41,6 +41,7 @@ from ..preview import PreviewPanel, ThumbStrip
 from ..widgets import (
     Card,
     CardHeader,
+    ElidedLabel,
     FieldRow,
     Segmented,
     ToolRow,
@@ -345,9 +346,11 @@ class CapturePage(QWidget):
         header.add_right(self.session_badge)
         card.add(header)
 
-        self.path_label = QLabel("尚未设置", card)
+        # 路径必须用 ElidedLabel：Windows 路径没有空格，开 wordWrap 也断不开，
+        # 一条长路径的 minimumSizeHint 能到 540px，会把整个右栏顶宽到
+        # 视口之外（而右栏关着水平滚动条，多出来的部分直接看不见）。
+        self.path_label = ElidedLabel("尚未设置", card)
         self.path_label.setObjectName("Mono")
-        self.path_label.setWordWrap(True)
         card.add(self.path_label)
 
         tools = ToolRow()

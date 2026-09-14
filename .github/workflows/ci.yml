@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   selfcheck:
-    name: 四道检查
+    name: 五道检查
     runs-on: windows-latest
 
     # runner 是英文 Windows，本地代码页 cp1252，而 Python 的 stdout 默认跟随本地
@@ -52,3 +52,14 @@ jobs:
       # 用 Qt offscreen 插件真实构造窗口并跑事件循环，覆盖控件构造与信号连接。
       - name: 界面冒烟
         run: python tools/smoke_ui.py
+
+      # 布局断言：右栏内容不能被撑出视口（水平滚动条是关掉的，超出的部分
+      # 直接看不见）、图片库格子不能被压扁、缩略图 DPR 要跟屏幕一致。
+      #
+      # continue-on-error 是**故意**的：这里的判据来自字体度量，而 runner 上
+      # 的中文字体是回退字体（本地是 Microsoft YaHei UI），同一段文字的宽度
+      # 会差出几十像素，硬卡会变成假失败。本地跑 tools/selfcheck.py 时它是
+      # 硬门槛，CI 上只做提示。
+      - name: 界面布局（仅提示）
+        continue-on-error: true
+        run: python tools/check_layout.py

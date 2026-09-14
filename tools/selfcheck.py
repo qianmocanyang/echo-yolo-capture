@@ -12,6 +12,7 @@
 | selfcheck_imports | 循环导入、语法错误、缺依赖 |
 | test_logic | 选区算错、坐标换算错、YOLO 划分泄漏、DB/写盘逻辑错 |
 | smoke_ui | 控件构造失败、信号连接错、页面切换崩 |
+| check_layout | 控件被静默裁掉（右栏被撑破、格子被压扁、缩略图 DPR 不对） |
 | smoke_boot | DPI 声明时序、单实例锁、Qt 初始化、异常钩子 |
 """
 from __future__ import annotations
@@ -39,6 +40,7 @@ CHECKS = [
     ("模块导入", "tools/selfcheck_imports.py", True),
     ("业务逻辑", "tests/test_logic.py", False),
     ("界面冒烟", "tools/smoke_ui.py", False),
+    ("界面布局", "tools/check_layout.py", False),
     ("启动入口冒烟", "tools/smoke_boot.py", False),
 ]
 
